@@ -3,7 +3,7 @@
 Selecting & Excluding
 =======================
 
-Cosmos allows you to filter to a subset of your dbt project in each ``DbtDag`` / ``DbtTaskGroup`` using the ``select `` and ``exclude`` parameters in the ``RenderConfig`` class.
+Cosmos allows you to filter to a subset of your dbt project in each ``DbtDag`` / ``DbtTaskGroup`` using the ``select`` and ``exclude`` parameters in the ``RenderConfig`` class.
 
  Since Cosmos 1.3, the ``selector`` parameter is also available in ``RenderConfig`` when using the ``LoadMode.DBT_LS`` to parse the dbt project into Airflow.
 
@@ -14,12 +14,23 @@ Using ``select`` and ``exclude``
 The ``select`` and ``exclude`` parameters are lists, with values like the following:
 
 - ``tag:my_tag``: include/exclude models with the tag ``my_tag``
+- ``config.meta.some_key:some_value``: include/exclude models with ``config.meta_some_key: some_value``
 - ``config.materialized:table``: include/exclude models with the config ``materialized: table``
-- ``path:analytics/tables``: include/exclude models in the ``analytics/tables`` directory
+- ``path:analytics/tables``: include/exclude models in the ``analytics/tables`` directory. In this example, ``analytics/table`` is a relative path, but absolute paths are also supported.
 - ``+node_name+1`` (graph operators): include/exclude the node with name ``node_name``, all its parents, and its first generation of children (`dbt graph selector docs <https://docs.getdbt.com/reference/node-selection/graph-operators>`_)
+- ``+/path/to/model_g+`` (graph operators): include/exclude all the nodes in the absolute path ``/path/to/model_g``, their parents and children. Relative paths are also supported.
+- ``+tag:nightly`` (graph operators): include/exclude all nodes that have tag ``nightly`` and their parents.
+- ``+config.materialized:view`` (graph operators): include/exclude all the nodes that have the materialization ``view`` and their parents
 - ``@node_name`` (@ operator): include/exclude the node with name ``node_name``, all its descendants, and all ancestors of those descendants. This is useful in CI environments where you want to build a model and all its descendants, but you need the ancestors of those descendants to exist first.
 - ``tag:my_tag,+node_name`` (intersection): include/exclude ``node_name`` and its parents if they have the tag ``my_tag`` (`dbt set operator docs <https://docs.getdbt.com/reference/node-selection/set-operators>`_)
 - ``['tag:first_tag', 'tag:second_tag']`` (union): include/exclude nodes that have either ``tag:first_tag`` or ``tag:second_tag``
+- ``resource_type:<resource>``: include nodes with the resource type ``seed, snapshot, model, test, source``. For example, ``resource_type:source`` returns only nodes where resource_type == SOURCE
+- ``exclude_resource_type:<resource>``: exclude nodes with the resource type ``analysis, exposure, metric, model, saved_query, seed, semantic_model, snapshot, source, test, unit_test``. For example, ``exclude_resource_type:source`` returns only nodes where resource_type != SOURCE
+- ``source:my_source``: include/exclude nodes that have the source ``my_source`` and are of resource_type ``source``
+- ``source:my_source+``: include/exclude nodes that have the source ``my_source`` and their children
+- ``source:my_source.my_table``: include/exclude nodes that have the source ``my_source`` and the table ``my_table``
+- ``exposure:my_exposure``: include/exclude nodes that have the exposure ``my_exposure`` and are of resource_type ``exposure``
+- ``exposure:+my_exposure``: include/exclude nodes that have the exposure ``my_exposure`` and their parents
 
 .. note::
 

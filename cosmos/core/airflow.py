@@ -1,11 +1,20 @@
 from __future__ import annotations
 
-import importlib
-from typing import Any
+from copy import deepcopy
 
-from airflow.models import BaseOperator
+from cosmos._utils.importer import load_method_from_module
+
+try:  # Airflow 3
+    from airflow.sdk.bases.operator import BaseOperator
+except ImportError:  # Airflow 2
+    from airflow.models import BaseOperator
 from airflow.models.dag import DAG
-from airflow.utils.task_group import TaskGroup
+
+try:
+    # Airflow 3.1 onwards
+    from airflow.sdk import TaskGroup
+except ImportError:
+    from airflow.utils.task_group import TaskGroup
 
 from cosmos.core.graph.entities import Task
 from cosmos.log import get_logger
@@ -25,23 +34,19 @@ def get_airflow_task(task: Task, dag: DAG, task_group: TaskGroup | None = None) 
     # first, import the operator class from the
     # fully qualified name defined in the task
     module_name, class_name = task.operator_class.rsplit(".", 1)
-    module = importlib.import_module(module_name)
-    Operator = getattr(module, class_name)
+    Operator = load_method_from_module(module_name, class_name)
 
-    task_kwargs: dict[str, Any] = {}
+    task_kwargs = task.arguments
     if task.owner != "":
+        task_kwargs = deepcopy(task.arguments)
         task_kwargs["owner"] = task.owner
-
-    for k, v in task.airflow_task_config.items():
-        task_kwargs[k] = v
 
     airflow_task = Operator(
         task_id=task.id,
         dag=dag,
         task_group=task_group,
-        **task_kwargs,
         **({} if class_name == "EmptyOperator" else {"extra_context": task.extra_context}),
-        **task.arguments,
+        **task_kwargs,
     )
 
     if not isinstance(airflow_task, BaseOperator):

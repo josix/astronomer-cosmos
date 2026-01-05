@@ -29,6 +29,10 @@ Data-Aware Scheduling
 
 By default, if using a version between Airflow 2.4 or higher is used, Cosmos emits `Airflow Datasets <https://airflow.apache.org/docs/apache-airflow/stable/concepts/datasets.html>`_ when running dbt projects. This allows you to use Airflow's data-aware scheduling capabilities to schedule your dbt projects. Cosmos emits datasets using the OpenLineage URI format, as detailed in the `OpenLineage Naming Convention <https://github.com/OpenLineage/OpenLineage/blob/main/spec/Naming.md>`_.
 
+.. important::
+
+   This feature is only available for ``ExecutionMode.LOCAL``, ``ExecutionMode.VIRTUALENV``, ``ExecutionMode.WATCHER`` and ``ExecutionMode.AIRFLOW_ASYNC``.
+
 Cosmos calculates these URIs during the task execution, by using the library `OpenLineage Integration Common <https://pypi.org/project/openlineage-integration-common/>`_.
 
 This block illustrates a Cosmos-generated dataset for Postgres:
@@ -132,6 +136,28 @@ From Cosmos 1.7 and Airflow 2.10, it is also possible to trigger DAGs be to be r
 Known Limitations
 .................
 
+Airflow 3.0 and beyond
+______________________
+
+Airflow Asset (Dataset) URIs validation rules changed in Airflow 3.0.0 and OpenLineage URIs (standard used by Cosmos) are no longer valid in Airflow 3.
+
+Therefore, if using Cosmos with Airflow 3, the Airflow Dataset URIs will be changed to use slashes instead of dots to separate the schema and table name.
+
+Example of Airflow 2 Cosmos Dataset URI:
+- postgres://0.0.0.0:5434/postgres.public.orders
+
+Example of Airflow 3 Cosmos Asset URI:
+- postgres://0.0.0.0:5434/postgres/public/orders
+
+
+If you want to use the Airflow 3 URI standard while still using Airflow 2, please set:
+
+.. code-block:: bash
+
+    export AIRFLOW__COSMOS__USE_DATASET_AIRFLOW3_URI_STANDARD=1
+
+Remember to update any DAGs that are scheduled using this dataset.
+
 Airflow 2.9 and below
 _____________________
 
@@ -175,3 +201,5 @@ they can set this configuration to ``False``. It can also be set in the ``airflo
 
     [cosmos]
     enable_dataset_alias = False
+
+Starting in Airflow 3, Cosmos users no longer allowed to set ``AIRFLOW__COSMOS__ENABLE_DATASET_ALIAS`` to ``True``.

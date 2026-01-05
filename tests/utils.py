@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import sys
+import warnings
 from datetime import datetime
 from typing import Any
 
+import sqlalchemy
 from airflow.configuration import secrets_backend_list
 from airflow.exceptions import AirflowSkipException
 from airflow.models.dag import DAG
@@ -15,7 +17,11 @@ from airflow.utils import timezone
 from airflow.utils.session import NEW_SESSION, provide_session
 from airflow.utils.state import DagRunState, State
 from airflow.utils.types import DagRunType
+from packaging import version
+from packaging.version import Version
 from sqlalchemy.orm.session import Session
+
+from cosmos.constants import AIRFLOW_VERSION
 
 log = logging.getLogger(__name__)
 
@@ -24,10 +30,81 @@ def run_dag(dag: DAG, conn_file_path: str | None = None) -> DagRun:
     return test_dag(dag=dag, conn_file_path=conn_file_path)
 
 
-# DAG.test() was added in Airflow version 2.5.0. And to test on older Airflow versions, we need to copy the
-# implementation here.
-@provide_session
+def check_dag_success(dag_run: DagRun | None, expect_success: bool = True) -> bool:
+    """Check if a DAG was successful, if that Airflow version allows it."""
+    if dag_run is not None:
+        if expect_success:
+            return dag_run.state == DagRunState.SUCCESS
+        else:
+            return dag_run.state == DagRunState.FAILED
+    return True
+
+
+def new_test_dag(dag: DAG) -> DagRun:
+    if AIRFLOW_VERSION >= version.Version("3.1"):
+        # Airflow 3.1+ requires DAG to be serialized to database before calling dag.test()
+        # because create_dagrun() checks for DagVersion and DagModel records
+
+        from airflow.models.dagbag import DagBag, sync_bag_to_db
+        from airflow.models.dagbundle import DagBundleModel
+        from airflow.utils.session import create_session
+
+        # Create DagBundle if it doesn't exist (required for DagModel foreign key)
+        # This mimics what get_bagged_dag does via manager.sync_bundles_to_db()
+        with create_session() as session:
+            dag_bundle = DagBundleModel(name="test_bundle")
+            session.merge(dag_bundle)
+            session.commit()
+
+        # This creates both DagModel and DagVersion records
+        dagbag = DagBag(include_examples=False)
+        dagbag.bag_dag(dag)
+        sync_bag_to_db(dagbag, bundle_name="test_bundle", bundle_version="1")
+        dr = dag.test(logical_date=timezone.utcnow())
+    elif AIRFLOW_VERSION >= version.Version("3.0"):
+        dr = dag.test(logical_date=timezone.utcnow())
+    else:
+        dr = dag.test()
+    return dr
+
+
 def test_dag(
+    dag, conn_file_path: str | None = None, custom_tester: bool = False, expect_success: bool = True
+) -> DagRun:
+    dr = None
+    if custom_tester:
+        dr = test_old_dag(dag, conn_file_path)
+    elif AIRFLOW_VERSION not in (Version("2.10.0"), Version("2.10.1"), Version("2.10.2"), Version("2.11.0")):
+        dr = new_test_dag(dag)
+        assert check_dag_success(dr, expect_success), f"Dag {dag.dag_id} did not run successfully. State: {dr.state}. "
+    else:
+        # This is a work around until we fix the issue in Airflow:
+        # https://github.com/apache/airflow/issues/42495
+        """
+        FAILED tests/test_example_dags.py::test_example_dag[example_model_version] - sqlalchemy.exc.PendingRollbackError:
+        This Session's transaction has been rolled back due to a previous exception during flush. To begin a new transaction with this Session, first issue Session.rollback().
+        Original exception was: Can't flush None value found in collection DatasetModel.aliases (Background on this error at: https://sqlalche.me/e/14/7s2a)
+        FAILED tests/test_example_dags.py::test_example_dag[basic_cosmos_dag]
+        FAILED tests/test_example_dags.py::test_example_dag[cosmos_profile_mapping]
+        FAILED tests/test_example_dags.py::test_example_dag[user_defined_profile]
+        """
+        try:
+            dr = new_test_dag(dag)
+            assert check_dag_success(
+                dr, expect_success
+            ), f"Dag {dag.dag_id} did not run successfully. State: {dr.state}. "
+        except sqlalchemy.exc.PendingRollbackError:
+            warnings.warn(
+                "Early versions of Airflow 2.10 and Airflow 2.11 have issues when running the test command with DatasetAlias / Datasets"
+            )
+    return dr
+
+
+# TODO: Test operators/test_local.py::test_run_operator_dataset_inlets_and_outlets_airflow_210
+# still depends on this utility. Remove this once that test is fixed.
+# https://github.com/astronomer/astronomer-cosmos/issues/2166
+@provide_session
+def test_old_dag(
     dag,
     execution_date: datetime | None = None,
     run_conf: dict[str, Any] | None = None,
@@ -87,7 +164,7 @@ def test_dag(
 
     print("conn_file_path", conn_file_path)
 
-    return dr, session
+    return dr
 
 
 def add_logger_if_needed(dag: DAG, ti: TaskInstance):
@@ -167,4 +244,5 @@ def _get_or_create_dagrun(
         conf=conf,
     )
     log.info("created dagrun %s", str(dr))
+
     return dr

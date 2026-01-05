@@ -6,8 +6,12 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from airflow.decorators import dag
-from airflow.operators.empty import EmptyOperator
+from airflow import DAG
+
+try:
+    from airflow.providers.standard.operators.empty import EmptyOperator
+except ImportError:
+    from airflow.operators.empty import EmptyOperator
 
 from cosmos import DbtTaskGroup, ExecutionConfig, LoadMode, ProfileConfig, ProjectConfig, RenderConfig
 from cosmos.profiles import DbtProfileConfigVars, PostgresUserPasswordProfileMapping
@@ -30,14 +34,13 @@ profile_config = ProfileConfig(
 render_config = RenderConfig(load_method=LoadMode.DBT_MANIFEST, select=["path:seeds/raw_customers.csv"])
 
 
-@dag(
-    schedule_interval="@daily",
+with DAG(
+    dag_id="cosmos_manifest_example",
+    schedule="@daily",
     start_date=datetime(2023, 1, 1),
     catchup=False,
-    default_args={"retries": 2},
-)
-def cosmos_manifest_example() -> None:
-
+    default_args={"retries": 0},
+):
     pre_dbt = EmptyOperator(task_id="pre_dbt")
 
     # [START local_example]
@@ -105,6 +108,3 @@ def cosmos_manifest_example() -> None:
     post_dbt = EmptyOperator(task_id="post_dbt")
 
     (pre_dbt >> local_example >> aws_s3_example >> gcp_gs_example >> azure_abfs_example >> post_dbt)
-
-
-cosmos_manifest_example()

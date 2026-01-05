@@ -17,12 +17,22 @@ from airflow.models import Variable
 
 from cosmos import settings
 from cosmos.config import CosmosConfigException, ExecutionConfig, ProfileConfig, ProjectConfig, RenderConfig
-from cosmos.constants import DBT_TARGET_DIR_NAME, DbtResourceType, ExecutionMode, SourceRenderingBehavior
+from cosmos.constants import (
+    _AIRFLOW3_MAJOR_VERSION,
+    AIRFLOW_VERSION,
+    DBT_LOG_FILENAME,
+    DBT_TARGET_DIR_NAME,
+    DbtResourceType,
+    ExecutionMode,
+    InvocationMode,
+    SourceRenderingBehavior,
+)
 from cosmos.dbt.graph import (
     CosmosLoadDbtException,
     DbtGraph,
     DbtNode,
     LoadMode,
+    _normalize_path,
     parse_dbt_ls_output,
     run_command,
 )
@@ -33,11 +43,17 @@ DBT_PROJECTS_ROOT_DIR = Path(__file__).parent.parent.parent / "dev/dags/dbt"
 DBT_PROJECT_NAME = "jaffle_shop"
 ALTERED_DBT_PROJECT_NAME = "altered_jaffle_shop"
 SAMPLE_MANIFEST = Path(__file__).parent.parent / "sample/manifest.json"
+SAMPLE_SMALL_MANIFEST = Path(__file__).parent.parent / "sample/small_manifest.json"
 SAMPLE_MANIFEST_PY = Path(__file__).parent.parent / "sample/manifest_python.json"
 SAMPLE_MANIFEST_MODEL_VERSION = Path(__file__).parent.parent / "sample/manifest_model_version.json"
 SAMPLE_MANIFEST_SOURCE = Path(__file__).parent.parent / "sample/manifest_source.json"
 SAMPLE_DBT_LS_OUTPUT = Path(__file__).parent.parent / "sample/sample_dbt_ls.txt"
 SOURCE_RENDERING_BEHAVIOR = SourceRenderingBehavior(os.getenv("SOURCE_RENDERING_BEHAVIOR", "none"))
+
+if AIRFLOW_VERSION.major >= _AIRFLOW3_MAJOR_VERSION:
+    object_storage_path = "airflow.sdk.ObjectStoragePath"
+else:
+    object_storage_path = "airflow.io.path.ObjectStoragePath"
 
 
 @pytest.fixture
@@ -100,6 +116,78 @@ def test_dbt_node_name_and_select(unique_id, expected_name, expected_select):
     assert node.resource_name == expected_select
 
 
+def test_dbt_node_meta():
+    valid_node = DbtNode(
+        unique_id="some-id",
+        resource_type=DbtResourceType.MODEL,
+        depends_on=[],
+        file_path="",
+        config={"meta": {"cosmos": {}}},
+    )
+    assert valid_node.meta == {}
+
+    invalid_node = DbtNode(
+        unique_id="some-id",
+        resource_type=DbtResourceType.MODEL,
+        depends_on=[],
+        file_path="",
+        config={"meta": {"cosmos": ""}},
+    )
+    with pytest.raises(CosmosLoadDbtException) as exc_info:
+        invalid_node.meta
+
+    error_msg = "Error parsing dbt node <some-id>. Invalid type: 'cosmos' in meta must be a dict."
+    assert error_msg in str(exc_info.value)
+
+
+def test_dbt_node_operator_kwargs_to_override():
+    valid_node = DbtNode(
+        unique_id="some-id",
+        resource_type=DbtResourceType.MODEL,
+        depends_on=[],
+        file_path="",
+        config={"meta": {"cosmos": {"operator_kwargs": {}}}},
+    )
+    assert valid_node.operator_kwargs_to_override == {}
+
+    invalid_node = DbtNode(
+        unique_id="some-id",
+        resource_type=DbtResourceType.MODEL,
+        depends_on=[],
+        file_path="",
+        config={"meta": {"cosmos": {"operator_kwargs": ""}}},
+    )
+    with pytest.raises(CosmosLoadDbtException) as exc_info:
+        invalid_node.operator_kwargs_to_override
+
+    error_msg = "Error parsing dbt node <some-id>. Invalid type: 'operator_kwargs' in meta.cosmos must be a dict."
+    assert error_msg in str(exc_info.value)
+
+
+def test_dbt_profile_config_to_override():
+    valid_node = DbtNode(
+        unique_id="some-id",
+        resource_type=DbtResourceType.MODEL,
+        depends_on=[],
+        file_path="",
+        config={"meta": {"cosmos": {"profile_config": {}}}},
+    )
+    assert valid_node.profile_config_to_override == {}
+
+    invalid_node = DbtNode(
+        unique_id="some-id",
+        resource_type=DbtResourceType.MODEL,
+        depends_on=[],
+        file_path="",
+        config={"meta": {"cosmos": {"profile_config": ""}}},
+    )
+    with pytest.raises(CosmosLoadDbtException) as exc_info:
+        invalid_node.profile_config_to_override
+
+    error_msg = "Error parsing dbt node <some-id>. Invalid type: 'profile_config' in meta.cosmos must be a dict."
+    assert error_msg in str(exc_info.value)
+
+
 @pytest.mark.parametrize(
     "unique_id,expected_dict",
     [
@@ -113,6 +201,7 @@ def test_dbt_node_name_and_select(unique_id, expected_name, expected_select):
                 "tags": [],
                 "config": {},
                 "has_test": False,
+                "has_non_detached_test": False,
                 "resource_name": "customers",
                 "name": "customers",
             },
@@ -127,6 +216,7 @@ def test_dbt_node_name_and_select(unique_id, expected_name, expected_select):
                 "tags": [],
                 "config": {},
                 "has_test": False,
+                "has_non_detached_test": False,
                 "resource_name": "customers.v1",
                 "name": "customers_v1",
             },
@@ -181,6 +271,31 @@ def test_load_via_manifest_with_exclude(project_name, manifest_filepath, model_f
         "model.jaffle_shop.stg_payments",
     ]
     assert sample_node.file_path == DBT_PROJECTS_ROOT_DIR / f"{project_name}/models/{model_filepath}"
+
+
+def test_load_via_manifest_with_ms_windows_manifest_and_star_selector():
+    # This test is based on a real user-case that in 1.9.0 and before would return an empty list of filtered nodes
+    project_config = ProjectConfig(
+        dbt_project_path=DBT_PROJECTS_ROOT_DIR,  # this value is not used in DAG rendering when the manifest is given
+        manifest_path=SAMPLE_SMALL_MANIFEST,
+    )
+    profile_config = ProfileConfig(
+        profile_name="test",
+        target_name="test",
+        profiles_yml_filepath=DBT_PROJECTS_ROOT_DIR / DBT_PROJECT_NAME / "profiles.yml",
+    )
+    render_config = RenderConfig(select=["path:models/edr*+"])
+    execution_config = ExecutionConfig(dbt_project_path=project_config.dbt_project_path)
+    dbt_graph = DbtGraph(
+        project=project_config,
+        execution_config=execution_config,
+        profile_config=profile_config,
+        render_config=render_config,
+    )
+    dbt_graph.load_from_dbt_manifest()
+
+    assert len(dbt_graph.nodes) == 1
+    assert len(dbt_graph.filtered_nodes) == 1
 
 
 @pytest.mark.parametrize(
@@ -439,15 +554,37 @@ def test_load(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("enable_cache_profile", [True, False])
+@pytest.mark.parametrize(
+    "runner,enable_cache_profile",
+    [
+        ("subprocess", True),
+        ("subprocess", False),
+        ("dbt_runner", True),
+        ("dbt_runner", False),
+    ],
+)
 @patch("cosmos.config.is_profile_cache_enabled")
 @patch("cosmos.dbt.graph.Popen")
+@patch("cosmos.dbt.graph.dbt_runner.run_command")
 def test_load_via_dbt_ls_does_not_create_target_logs_in_original_folder(
-    mock_popen, is_profile_cache_enabled, enable_cache_profile, tmp_dbt_project_dir, postgres_profile_config
+    mock_dbt_runner,
+    mock_popen,
+    is_profile_cache_enabled,
+    runner,
+    enable_cache_profile,
+    tmp_dbt_project_dir,
+    postgres_profile_config,
 ):
+    import_patch = None
+    if runner == "subprocess":
+        original_sys_modules = sys.modules
+        import_patch = patch.dict(sys.modules, {"dbt.cli.main": None})
+        import_patch.start()
+        mock_popen().communicate.return_value = ("", "")
+        mock_popen().returncode = 0
+
     is_profile_cache_enabled.return_value = enable_cache_profile
-    mock_popen().communicate.return_value = ("", "")
-    mock_popen().returncode = 0
+
     assert not (tmp_dbt_project_dir / "target").exists()
     assert not (tmp_dbt_project_dir / "logs").exists()
 
@@ -467,7 +604,12 @@ def test_load_via_dbt_ls_does_not_create_target_logs_in_original_folder(
     assert not (tmp_dbt_project_dir / "target").exists()
     assert not (tmp_dbt_project_dir / "logs").exists()
 
-    used_cwd = Path(mock_popen.call_args[0][0][5])
+    if import_patch is not None:
+        used_cwd = Path(mock_popen.call_args[0][0][5])
+        import_patch.stop()
+        sys.modules = original_sys_modules
+    else:
+        used_cwd = Path(mock_dbt_runner.call_args[1]["cwd"])
     assert used_cwd != project_config.dbt_project_path
     assert not used_cwd.exists()
 
@@ -521,7 +663,7 @@ def test_load_via_dbt_ls_with_exclude(postgres_profile_config):
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "project_dir,node_count",
-    [(DBT_PROJECTS_ROOT_DIR / ALTERED_DBT_PROJECT_NAME, 39), (DBT_PROJECTS_ROOT_DIR / "jaffle_shop_python", 28)],
+    [(DBT_PROJECTS_ROOT_DIR / ALTERED_DBT_PROJECT_NAME, 40), (DBT_PROJECTS_ROOT_DIR / "jaffle_shop_python", 28)],
 )
 def test_load_via_dbt_ls_without_exclude(project_dir, node_count, postgres_profile_config):
     project_config = ProjectConfig(dbt_project_path=project_dir)
@@ -637,7 +779,14 @@ def test_load_via_dbt_ls_with_sources(load_method):
 
 
 @pytest.mark.integration
-def test_load_via_dbt_ls_without_dbt_deps(postgres_profile_config):
+@pytest.mark.parametrize("runner", ("subprocess", "dbt_runner"))
+def test_load_via_dbt_ls_without_dbt_deps(runner, postgres_profile_config):
+    some_patch = None
+    if runner == "subprocess":
+        original_sys_modules = sys.modules
+        some_patch = patch.dict(sys.modules, {"dbt.cli.main": None})
+        some_patch.start()
+
     project_config = ProjectConfig(dbt_project_path=DBT_PROJECTS_ROOT_DIR / DBT_PROJECT_NAME)
     render_config = RenderConfig(
         dbt_project_path=DBT_PROJECTS_ROOT_DIR / DBT_PROJECT_NAME,
@@ -657,6 +806,10 @@ def test_load_via_dbt_ls_without_dbt_deps(postgres_profile_config):
 
     expected = "Unable to run dbt ls command due to missing dbt_packages. Set RenderConfig.dbt_deps=True."
     assert err_info.value.args[0] == expected
+
+    if some_patch is not None:
+        sys.modules = original_sys_modules
+        some_patch.stop()
 
 
 @pytest.mark.integration
@@ -703,15 +856,18 @@ def test_load_via_dbt_ls_without_dbt_deps_and_preinstalled_dbt_packages(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("enable_cache_profile", [True, False])
+@pytest.mark.parametrize("enable_cache_profile", (True, False))
 @patch("cosmos.config.is_profile_cache_enabled")
-def test_load_via_dbt_ls_caching_partial_parsing(
-    is_profile_cache_enabled, enable_cache_profile, tmp_dbt_project_dir, postgres_profile_config, caplog, tmp_path
+@patch.dict(sys.modules, {"dbt.cli.main": None})
+def test_load_via_dbt_ls_caching_partial_parsing_subprocess(
+    is_profile_cache_enabled,
+    enable_cache_profile,
+    tmp_dbt_project_dir,
+    postgres_profile_config,
+    caplog,
+    tmp_path,
 ):
-    """
-    When using RenderConfig.enable_mock_profile=False and defining DbtGraph.cache_dir,
-    Cosmos should leverage dbt partial parsing.
-    """
+
     caplog.set_level(logging.DEBUG)
 
     is_profile_cache_enabled.return_value = enable_cache_profile
@@ -822,6 +978,7 @@ def test_load_via_dbt_ls_with_zero_returncode_and_non_empty_stderr(
 
 @pytest.mark.integration
 @patch("cosmos.dbt.graph.Popen")
+@patch.dict(sys.modules, {"dbt.cli.main": None})
 def test_load_via_dbt_ls_with_non_zero_returncode(mock_popen, postgres_profile_config):
     mock_popen().communicate.return_value = ("", "Some stderr message")
     mock_popen().returncode = 1
@@ -845,6 +1002,7 @@ def test_load_via_dbt_ls_with_non_zero_returncode(mock_popen, postgres_profile_c
 
 @pytest.mark.integration
 @patch("cosmos.dbt.graph.Popen.communicate", return_value=("Some Runtime Error", ""))
+@patch.dict(sys.modules, {"dbt.cli.main": None})
 def test_load_via_dbt_ls_with_runtime_error_in_stdout(mock_popen_communicate, postgres_profile_config):
     # It may seem strange, but at least until dbt 1.6.0, there are circumstances when it outputs errors to stdout
     project_config = ProjectConfig(dbt_project_path=DBT_PROJECTS_ROOT_DIR / DBT_PROJECT_NAME)
@@ -890,6 +1048,31 @@ def test_load_via_load_via_custom_parser(project_name, nodes_count):
 
     assert dbt_graph.nodes == dbt_graph.filtered_nodes
     assert len(dbt_graph.nodes) == nodes_count
+
+
+@pytest.mark.parametrize("project_name", [("altered_jaffle_shop"), ("jaffle_shop_python")])
+def test_validate_load_via_load_via_custom_parser_deprecated(project_name):
+    """Deprecating warnings should be raised when using load_mode CUSTOM."""
+    project_config = ProjectConfig(dbt_project_path=DBT_PROJECTS_ROOT_DIR / project_name)
+    execution_config = ExecutionConfig(dbt_project_path=DBT_PROJECTS_ROOT_DIR / project_name)
+    render_config = RenderConfig(
+        dbt_project_path=DBT_PROJECTS_ROOT_DIR / project_name,
+        source_rendering_behavior=SOURCE_RENDERING_BEHAVIOR,
+    )
+    profile_config = ProfileConfig(
+        profile_name="test",
+        target_name="test",
+        profiles_yml_filepath=DBT_PROJECTS_ROOT_DIR / project_name / "profiles.yml",
+    )
+    dbt_graph = DbtGraph(
+        project=project_config,
+        profile_config=profile_config,
+        render_config=render_config,
+        execution_config=execution_config,
+    )
+
+    with pytest.deprecated_call():
+        dbt_graph.load_via_custom_parser()
 
 
 def test_load_via_load_via_custom_parser_select_rendering_config():
@@ -949,13 +1132,18 @@ def test_update_node_dependency_target_exist():
         profiles_yml_filepath=DBT_PROJECTS_ROOT_DIR / DBT_PROJECT_NAME / "profiles.yml",
     )
     execution_config = ExecutionConfig(dbt_project_path=project_config.dbt_project_path)
-    dbt_graph = DbtGraph(project=project_config, execution_config=execution_config, profile_config=profile_config)
+    dbt_graph = DbtGraph(
+        project=project_config,
+        execution_config=execution_config,
+        profile_config=profile_config,
+    )
     dbt_graph.load()
 
     for _, nodes in dbt_graph.nodes.items():
         if nodes.resource_type == DbtResourceType.TEST:
             for node_id in nodes.depends_on:
                 assert dbt_graph.nodes[node_id].has_test is True
+                assert dbt_graph.nodes[node_id].has_non_detached_test is True
 
 
 def test_update_node_dependency_test_not_exist():
@@ -982,6 +1170,7 @@ def test_update_node_dependency_test_not_exist():
 
     for _, nodes in dbt_graph.filtered_nodes.items():
         assert nodes.has_test is False
+        assert nodes.has_non_detached_test is False
 
 
 def test_tag_selected_node_test_exist():
@@ -1008,6 +1197,7 @@ def test_tag_selected_node_test_exist():
         assert node.tags == ["test_tag"]
         if node.resource_type == DbtResourceType.MODEL:
             assert node.has_test is True
+            assert node.has_non_detached_test is True
 
 
 @pytest.mark.integration
@@ -1104,6 +1294,7 @@ def test_load_via_dbt_ls_file():
     ],
 )
 @patch("cosmos.dbt.graph.Popen")
+@patch.dict(sys.modules, {"dbt.cli.main": None})
 def test_run_command(mock_popen, stdout, returncode):
     fake_command = ["fake", "command"]
     fake_dir = Path("fake_dir")
@@ -1112,7 +1303,7 @@ def test_run_command(mock_popen, stdout, returncode):
     mock_popen.return_value.communicate.return_value = (stdout, "")
     mock_popen.return_value.returncode = returncode
 
-    return_value = run_command(fake_command, fake_dir, env_vars)
+    return_value = run_command(fake_command, fake_dir, env_vars, InvocationMode.DBT_RUNNER)
     args, kwargs = mock_popen.call_args
     assert args[0] == fake_command
     assert kwargs["cwd"] == fake_dir
@@ -1121,7 +1312,84 @@ def test_run_command(mock_popen, stdout, returncode):
     assert return_value == stdout
 
 
+@pytest.mark.integration
+@patch.dict(sys.modules, {"dbt.cli.main": None})
+def test_run_command_success_with_log(tmp_dbt_project_dir):
+    project_dir = tmp_dbt_project_dir / DBT_PROJECT_NAME
+    (project_dir / DBT_LOG_FILENAME).touch()
+    response = run_command(
+        command=["dbt", "deps"],
+        env_vars=os.environ,
+        tmp_dir=project_dir,
+        invocation_mode=InvocationMode.SUBPROCESS,
+        log_dir=project_dir,
+    )
+    assert "Installing dbt-labs/dbt_utils" in response
+
+
+@patch("cosmos.dbt.graph.run_command_with_subprocess")
+@patch("cosmos.dbt.graph.run_command_with_dbt_runner")
+def test_run_command_forcing_subprocess(mock_dbt_runner, mock_subprocess, tmp_dbt_project_dir):
+    project_dir = tmp_dbt_project_dir / DBT_PROJECT_NAME
+    run_command(
+        command=["dbt", "deps"],
+        env_vars=os.environ,
+        tmp_dir=project_dir,
+        invocation_mode=InvocationMode.SUBPROCESS,
+        log_dir=project_dir,
+    )
+    assert mock_subprocess.called
+    assert not mock_dbt_runner.called
+
+
+@patch("cosmos.dbt.graph.dbt_runner.is_available", return_value=True)
+@patch("cosmos.dbt.graph.run_command_with_subprocess")
+@patch("cosmos.dbt.graph.run_command_with_dbt_runner")
+def test_run_command_forcing_dbt_runner(mock_dbt_runner, mock_subprocess, tmp_dbt_project_dir):
+    project_dir = tmp_dbt_project_dir / DBT_PROJECT_NAME
+    run_command(
+        command=["dbt", "deps"],
+        env_vars=os.environ,
+        tmp_dir=project_dir,
+        invocation_mode=InvocationMode.DBT_RUNNER,
+        log_dir=project_dir,
+    )
+    assert not mock_subprocess.called
+    assert mock_dbt_runner.called
+
+
+@pytest.mark.integration
+def test_run_command_with_dbt_runner_exception(tmp_dbt_project_dir):
+    with pytest.raises(CosmosLoadDbtException) as err_info:
+        run_command(
+            command=["dbt", "ls"],
+            env_vars=os.environ,
+            invocation_mode=InvocationMode.DBT_RUNNER,
+            tmp_dir=tmp_dbt_project_dir / DBT_PROJECT_NAME,
+        )
+    err_msg = "Unable to run dbt ls command due to missing dbt_packages"
+    assert err_msg in str(err_info.value)
+
+
+@pytest.mark.integration
+def test_run_command_with_dbt_runner_error(tmp_dbt_project_dir):
+    project_dir = tmp_dbt_project_dir / DBT_PROJECT_NAME
+    file_to_be_deleted = project_dir / "packages.yml"
+    file_to_be_deleted.unlink()
+
+    file_to_be_changed = project_dir / "models/staging/stg_orders.sql"
+    with open(str(file_to_be_changed), "w") as fp:
+        fp.writelines("select 1 as id")
+
+    with pytest.raises(CosmosLoadDbtException) as err_info:
+        run_command(
+            command=["dbt", "run"], env_vars=os.environ, invocation_mode=InvocationMode.DBT_RUNNER, tmp_dir=project_dir
+        )
+    assert "Unable to run ['dbt', 'run']" in str(err_info.value)
+
+
 @patch("cosmos.dbt.graph.Popen")
+@patch.dict(sys.modules, {"dbt.cli.main": None})
 def test_run_command_none_argument(mock_popen, caplog):
     fake_command = ["invalid-cmd", None]
     fake_dir = Path("fake_dir")
@@ -1129,7 +1397,7 @@ def test_run_command_none_argument(mock_popen, caplog):
 
     mock_popen.return_value.communicate.return_value = ("Invalid None argument", None)
     with pytest.raises(CosmosLoadDbtException) as exc_info:
-        run_command(fake_command, fake_dir, env_vars)
+        run_command(fake_command, fake_dir, env_vars, InvocationMode.SUBPROCESS)
 
     expected = "Unable to run ['invalid-cmd', '<None>'] due to the error:\nstderr: None\nstdout: Invalid None argument"
     assert str(exc_info.value) == expected
@@ -1150,7 +1418,7 @@ Values returned by mac_get_values:
         "model.some_package.some_model": DbtNode(
             unique_id="model.some_package.some_model",
             resource_type=DbtResourceType.MODEL,
-            file_path=Path("fake-project/models/some_model.sql"),
+            file_path=Path("some_package/models/some_model.sql"),
             tags=[],
             config={
                 "access": "protected",
@@ -1184,6 +1452,7 @@ Values returned by mac_get_values:
                 "unique_key": None,
             },
             depends_on=["source.some_source"],
+            package_name="some_package",
         ),
     }
     nodes = parse_dbt_ls_output(Path("fake-project"), dbt_ls_output)
@@ -1193,7 +1462,7 @@ Values returned by mac_get_values:
 
 
 def test_parse_dbt_ls_output():
-    fake_ls_stdout = '{"resource_type": "model", "name": "fake-name", "original_file_path": "fake-file-path.sql", "unique_id": "fake-unique-id", "tags": [], "config": {}}'
+    fake_ls_stdout = '{"resource_type": "model", "name": "fake-name", "package_name": "fake-project", "original_file_path": "fake-file-path.sql", "unique_id": "fake-unique-id", "tags": [], "config": {}}'
 
     expected_nodes = {
         "fake-unique-id": DbtNode(
@@ -1203,6 +1472,7 @@ def test_parse_dbt_ls_output():
             tags=[],
             config={},
             depends_on=[],
+            package_name="fake-project",
         ),
     }
     nodes = parse_dbt_ls_output(Path("fake-project"), fake_ls_stdout)
@@ -1211,7 +1481,7 @@ def test_parse_dbt_ls_output():
 
 
 def test_parse_dbt_ls_output_with_json_without_tags_or_config():
-    some_ls_stdout = '{"resource_type": "model", "name": "some-name", "original_file_path": "some-file-path.sql", "unique_id": "some-unique-id", "config": {}}'
+    some_ls_stdout = '{"resource_type": "model", "name": "some-name", "package_name": "some-project", "original_file_path": "some-file-path.sql", "unique_id": "some-unique-id", "config": {}}'
 
     expected_nodes = {
         "some-unique-id": DbtNode(
@@ -1221,6 +1491,7 @@ def test_parse_dbt_ls_output_with_json_without_tags_or_config():
             tags=[],
             config={},
             depends_on=[],
+            package_name="some-project",
         ),
     }
     nodes = parse_dbt_ls_output(Path("some-project"), some_ls_stdout)
@@ -1232,6 +1503,7 @@ def test_parse_dbt_ls_output_with_json_without_tags_or_config():
 @patch("cosmos.dbt.graph.Popen")
 @patch("cosmos.dbt.graph.DbtGraph.update_node_dependency")
 @patch("cosmos.config.RenderConfig.validate_dbt_command")
+@patch.dict(sys.modules, {"dbt.cli.main": None})
 def test_load_via_dbt_ls_project_config_env_vars(
     mock_validate, mock_update_nodes, mock_popen, mock_enable_cache, tmp_dbt_project_dir
 ):
@@ -1267,6 +1539,7 @@ def test_load_via_dbt_ls_project_config_env_vars(
 @patch("cosmos.dbt.graph.Popen")
 @patch("cosmos.dbt.graph.DbtGraph.update_node_dependency")
 @patch("cosmos.config.RenderConfig.validate_dbt_command")
+@patch.dict(sys.modules, {"dbt.cli.main": None})
 def test_profile_created_correctly_with_profile_mapping(
     mock_validate,
     mock_update_nodes,
@@ -1300,14 +1573,14 @@ def test_profile_created_correctly_with_profile_mapping(
 @patch("cosmos.dbt.graph.Popen")
 @patch("cosmos.dbt.graph.DbtGraph.update_node_dependency")
 @patch("cosmos.config.RenderConfig.validate_dbt_command")
+@patch.dict(sys.modules, {"dbt.cli.main": None})
 def test_load_via_dbt_ls_project_config_dbt_vars(
     mock_validate, mock_update_nodes, mock_popen, mock_use_case, tmp_dbt_project_dir
 ):
     """Tests that the dbt ls command in the subprocess has "--vars" with the project config dbt_vars."""
     mock_popen().communicate.return_value = ("", "")
     mock_popen().returncode = 0
-    dbt_vars = {"my_var1": "my_value1", "my_var2": "my_value2"}
-    project_config = ProjectConfig(dbt_vars=dbt_vars)
+    project_config = ProjectConfig(dbt_vars={"my_var1": "my_value1", "my_var2": "my_value2"})
     render_config = RenderConfig(
         dbt_project_path=tmp_dbt_project_dir / DBT_PROJECT_NAME,
         source_rendering_behavior=SOURCE_RENDERING_BEHAVIOR,
@@ -1326,14 +1599,49 @@ def test_load_via_dbt_ls_project_config_dbt_vars(
     )
     dbt_graph.load_via_dbt_ls()
     ls_command = mock_popen.call_args.args[0]
-    assert "--vars" in ls_command
-    assert ls_command[ls_command.index("--vars") + 1] == '{"my_var1": "my_value1", "my_var2": "my_value2"}'
+    assert "--vars" not in ls_command
 
 
 @patch("cosmos.dbt.graph.DbtGraph.should_use_dbt_ls_cache", return_value=False)
 @patch("cosmos.dbt.graph.Popen")
 @patch("cosmos.dbt.graph.DbtGraph.update_node_dependency")
 @patch("cosmos.config.RenderConfig.validate_dbt_command")
+@patch.dict(sys.modules, {"dbt.cli.main": None})
+def test_load_via_dbt_ls_dbt_graph_dbt_vars(
+    mock_validate, mock_update_nodes, mock_popen, mock_use_case, tmp_dbt_project_dir
+):
+    """Tests that the dbt ls command in the subprocess has "--vars" with the DbtGraph dbt_vars."""
+    mock_popen().communicate.return_value = ("", "")
+    mock_popen().returncode = 0
+    dbt_vars = {"my_var3": "my_value3"}
+    render_config = RenderConfig(
+        dbt_project_path=tmp_dbt_project_dir / DBT_PROJECT_NAME,
+        source_rendering_behavior=SOURCE_RENDERING_BEHAVIOR,
+    )
+    profile_config = ProfileConfig(
+        profile_name="test",
+        target_name="test",
+        profiles_yml_filepath=DBT_PROJECTS_ROOT_DIR / DBT_PROJECT_NAME / "profiles.yml",
+    )
+    execution_config = ExecutionConfig(dbt_project_path=tmp_dbt_project_dir / DBT_PROJECT_NAME)
+    dbt_graph = DbtGraph(
+        project=ProjectConfig(),
+        render_config=render_config,
+        execution_config=execution_config,
+        profile_config=profile_config,
+        dbt_vars=dbt_vars,
+    )
+    dbt_graph.load_via_dbt_ls()
+    ls_command = mock_popen.call_args.args[0]
+    assert "--vars" in ls_command
+    assert ls_command[ls_command.index("--vars") + 1] == json.dumps(dbt_vars, sort_keys=True)
+
+
+@patch("cosmos.dbt.graph.DbtGraph.should_use_dbt_ls_cache", return_value=False)
+@patch("cosmos.dbt.graph.Popen")
+@patch("cosmos.dbt.graph.DbtGraph.update_node_dependency")
+@patch("cosmos.config.RenderConfig.validate_dbt_command")
+@patch.dict(sys.modules, {"dbt.cli.main": None})
 def test_load_via_dbt_ls_render_config_selector_arg_is_used(
     mock_validate, mock_update_nodes, mock_popen, mock_enable_cache, tmp_dbt_project_dir
 ):
@@ -1370,6 +1678,7 @@ def test_load_via_dbt_ls_render_config_selector_arg_is_used(
 @patch("cosmos.dbt.graph.Popen")
 @patch("cosmos.dbt.graph.DbtGraph.update_node_dependency")
 @patch("cosmos.config.RenderConfig.validate_dbt_command")
+@patch.dict(sys.modules, {"dbt.cli.main": None})
 def test_load_via_dbt_ls_render_config_no_partial_parse(
     mock_validate, mock_update_nodes, mock_popen, mock_enable_cache, tmp_dbt_project_dir
 ):
@@ -1517,21 +1826,23 @@ def test_project_path_fails():
 
 
 @pytest.mark.parametrize(
-    "render_config,project_config,expected_dbt_ls_args",
+    "render_config,project_config,dbt_vars,expected_dbt_ls_args",
     [
-        (RenderConfig(), ProjectConfig(), []),
-        (RenderConfig(exclude=["package:snowplow"]), ProjectConfig(), ["--exclude", "package:snowplow"]),
+        (RenderConfig(), ProjectConfig(), None, []),
+        (RenderConfig(exclude=["package:snowplow"]), ProjectConfig(), None, ["--exclude", "package:snowplow"]),
         (
             RenderConfig(select=["tag:prod", "config.materialized:incremental"]),
             ProjectConfig(),
+            None,
             ["--select", "tag:prod", "config.materialized:incremental"],
         ),
-        (RenderConfig(selector="nightly"), ProjectConfig(), ["--selector", "nightly"]),
-        (RenderConfig(), ProjectConfig(dbt_vars={"a": 1}), ["--vars", '{"a": 1}']),
-        (RenderConfig(), ProjectConfig(partial_parse=False), ["--no-partial-parse"]),
+        (RenderConfig(selector="nightly"), ProjectConfig(), None, ["--selector", "nightly"]),
+        (RenderConfig(), ProjectConfig(dbt_vars={"a": 1}), {"k": "v"}, ["--vars", '{"k": "v"}']),
+        (RenderConfig(), ProjectConfig(partial_parse=False), None, ["--no-partial-parse"]),
         (
             RenderConfig(exclude=["1", "2"], select=["a", "b"], selector="nightly"),
             ProjectConfig(dbt_vars={"a": 1}, partial_parse=False),
+            {"k": "v"},
             [
                 "--exclude",
                 "1",
@@ -1540,7 +1851,7 @@ def test_project_path_fails():
                 "a",
                 "b",
                 "--vars",
-                '{"a": 1}',
+                '{"k": "v"}',
                 "--selector",
                 "nightly",
                 "--no-partial-parse",
@@ -1548,10 +1859,11 @@ def test_project_path_fails():
         ),
     ],
 )
-def test_dbt_ls_args(render_config, project_config, expected_dbt_ls_args):
+def test_dbt_ls_args(render_config, project_config, dbt_vars, expected_dbt_ls_args):
     graph = DbtGraph(
         project=project_config,
         render_config=render_config,
+        dbt_vars=dbt_vars,
     )
     assert graph.dbt_ls_args == expected_dbt_ls_args
 
@@ -1564,11 +1876,13 @@ def test_dbt_ls_cache_key_args_sorts_envvars():
 
 @patch("cosmos.dbt.graph.run_command")
 def test_run_dbt_deps(run_command_mock):
-    project_config = ProjectConfig(dbt_vars={"var-key": "var-value"})
-    graph = DbtGraph(project=project_config)
+    project_config = ProjectConfig()
+    graph = DbtGraph(project=project_config, dbt_vars={"var-key": "var-value"})
     graph.local_flags = []
     graph.run_dbt_deps("dbt", "/some/path", {})
-    run_command_mock.assert_called_with(["dbt", "deps", "--vars", '{"var-key": "var-value"}'], "/some/path", {})
+    run_command_mock.assert_called_with(
+        ["dbt", "deps", "--vars", '{"var-key": "var-value"}'], "/some/path", {}, InvocationMode.DBT_RUNNER, None
+    )
 
 
 @pytest.fixture()
@@ -1609,9 +1923,10 @@ def test_save_dbt_ls_cache(mock_variable_set, mock_datetime, tmp_dbt_project_dir
     hash_dir, hash_args = version.split(",")
     assert hash_args == "d41d8cd98f00b204e9800998ecf8427e"
     if sys.platform == "darwin":
-        assert hash_dir == "fa5edac64de49909d4b8cbc4dc8abd4f"
+        # We faced inconsistent hashing versions depending on the version of MacOS/Linux - the following line aims to address these.
+        assert hash_dir in ("7abb868ed1c22e78de1c00429d950a77", "85cba4ef17dd7c161938da6980a6ff85")
     else:
-        assert hash_dir == "9c9f712b6f6f1ace880dfc7f5f4ff051"
+        assert hash_dir == "85cba4ef17dd7c161938da6980a6ff85"
 
 
 @pytest.mark.integration
@@ -1722,7 +2037,7 @@ def test_should_use_dbt_ls_cache(enable_cache, enable_cache_dbt_ls, cache_id, sh
 
 
 @pytest.mark.skipif(not AIRFLOW_IO_AVAILABLE, reason="Airflow did not have Object Storage until the 2.8 release")
-@patch("airflow.io.path.ObjectStoragePath")
+@patch(object_storage_path)
 @patch("cosmos.config.ProjectConfig")
 @patch("cosmos.dbt.graph._configure_remote_cache_dir")
 def test_save_dbt_ls_cache_remote_cache_dir(
@@ -1746,7 +2061,7 @@ def test_save_dbt_ls_cache_remote_cache_dir(
 
 
 @pytest.mark.skipif(not AIRFLOW_IO_AVAILABLE, reason="Airflow did not have Object Storage until the 2.8 release")
-@patch("airflow.io.path.ObjectStoragePath")
+@patch(object_storage_path)
 @patch("cosmos.config.ProjectConfig")
 @patch("cosmos.dbt.graph._configure_remote_cache_dir")
 def test_get_dbt_ls_cache_remote_cache_dir(
@@ -1781,3 +2096,117 @@ def test_get_dbt_ls_cache_remote_cache_dir(
     }
 
     assert result == expected_result
+
+
+def test__normalize_path():
+    """
+    This normalizes the path (e.g. declared inside a manifest.json file) when it was created using MS Windows instead
+    of GNU Linux.
+    """
+    original_value = "seeds\\seed_ifs_util_manual_event_id.csv"
+    expected_value = "seeds/seed_ifs_util_manual_event_id.csv"
+    assert _normalize_path(original_value) == expected_value
+
+
+@pytest.mark.parametrize(
+    "pre_dbt_fusion_value,source_rendering_behaviour_value,expected_args_count",
+    [
+        (True, SourceRenderingBehavior.NONE, 4),
+        (False, SourceRenderingBehavior.NONE, 13),
+        (True, SourceRenderingBehavior.ALL, 13),
+        (False, SourceRenderingBehavior.ALL, 13),
+    ],
+)
+@patch("cosmos.dbt.graph.settings")
+@patch("cosmos.dbt.graph.run_command")
+def test_run_dbt_ls(
+    mock_run_command, mock_settings, pre_dbt_fusion_value, source_rendering_behaviour_value, expected_args_count
+):
+    mock_settings.pre_dbt_fusion = pre_dbt_fusion_value
+    graph = DbtGraph(
+        project=ProjectConfig(dbt_project_path="/tmp"),
+        render_config=RenderConfig(source_rendering_behavior=source_rendering_behaviour_value),
+    )
+    graph.local_flags = []
+    graph.run_dbt_ls(dbt_cmd="dbt", project_path=Path("/tmp"), tmp_dir=Path("/tmp"), env_vars={})
+    assert len(mock_run_command.call_args[0][0]) == expected_args_count
+
+
+# ------------------------------------------------------------------------------
+# Tests for handling `tags` field edge cases (null or missing) in manifest nodes
+# ------------------------------------------------------------------------------
+
+
+def _create_manifest_with_tags(tmp_path: Path, tags_value):
+    """Helper to create a minimal manifest with configurable `tags` value."""
+    manifest_content = {
+        "nodes": {
+            "model.test_project.my_model": {
+                "unique_id": "model.test_project.my_model",
+                "resource_type": "model",
+                "package_name": "test_project",
+                "depends_on": {"nodes": []},
+                "original_file_path": "models/my_model.sql",
+                # The key/value below is the part we vary across tests
+                **({"tags": tags_value} if tags_value is not _MISSING_TAGS else {}),
+                "config": {},
+            }
+        },
+        "sources": {},
+        "exposures": {},
+    }
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest_content))
+    return manifest_path
+
+
+_MISSING_TAGS = object()
+
+
+@pytest.mark.parametrize("tags_value", [None, _MISSING_TAGS])
+def test_load_manifest_handles_null_or_missing_tags(tags_value, tmp_path):
+    """Ensure that null or absent `tags` result in an empty list on the DbtNode object."""
+
+    project_path = tmp_path / "project"
+    (project_path / "models").mkdir(parents=True, exist_ok=True)
+
+    manifest_path = _create_manifest_with_tags(tmp_path, tags_value)
+
+    project_config = ProjectConfig(dbt_project_path=project_path, manifest_path=manifest_path)
+    render_config = RenderConfig(source_rendering_behavior=SOURCE_RENDERING_BEHAVIOR)
+    execution_config = ExecutionConfig(dbt_project_path=project_path)
+
+    dbt_graph = DbtGraph(
+        project=project_config,
+        render_config=render_config,
+        execution_config=execution_config,
+    )
+
+    dbt_graph.load_from_dbt_manifest()
+
+    node = dbt_graph.nodes["model.test_project.my_model"]
+    assert node.tags == []
+
+
+def test_add_downstream_nodes():
+    project_config = ProjectConfig(
+        dbt_project_path=DBT_PROJECTS_ROOT_DIR / DBT_PROJECT_NAME, manifest_path=SAMPLE_MANIFEST
+    )
+    profile_config = ProfileConfig(
+        profile_name="test",
+        target_name="test",
+        profiles_yml_filepath=DBT_PROJECTS_ROOT_DIR / DBT_PROJECT_NAME / "profiles.yml",
+    )
+    render_config = RenderConfig(source_rendering_behavior=SOURCE_RENDERING_BEHAVIOR)
+    execution_config = ExecutionConfig(dbt_project_path=project_config.dbt_project_path)
+    dbt_graph = DbtGraph(
+        project=project_config,
+        execution_config=execution_config,
+        profile_config=profile_config,
+        render_config=render_config,
+    )
+    dbt_graph.load()
+
+    target_node = "model.jaffle_shop.stg_payments"
+    downstream_nodes = ["model.jaffle_shop.customers", "model.jaffle_shop.orders"]
+    assert dbt_graph.nodes.get(target_node).downstream == downstream_nodes

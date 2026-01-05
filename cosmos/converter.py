@@ -8,20 +8,28 @@ import inspect
 import os
 import platform
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 from warnings import warn
 
 from airflow.models.dag import DAG
-from airflow.utils.task_group import TaskGroup
+
+try:
+    # Airflow 3.1 onwards
+    from airflow.sdk import TaskGroup
+except ImportError:
+    from airflow.utils.task_group import TaskGroup
 
 from cosmos import cache, settings
 from cosmos.airflow.graph import build_airflow_graph
 from cosmos.config import ExecutionConfig, ProfileConfig, ProjectConfig, RenderConfig
-from cosmos.constants import ExecutionMode
+from cosmos.constants import ExecutionMode, LoadMode
 from cosmos.dbt.graph import DbtGraph
+from cosmos.dbt.project import has_non_empty_dependencies_file
 from cosmos.dbt.selector import retrieve_by_label
 from cosmos.exceptions import CosmosValueError
 from cosmos.log import get_logger
+from cosmos.versioning import _create_folder_version_hash
 
 logger = get_logger(__name__)
 
@@ -67,11 +75,11 @@ def airflow_kwargs(**kwargs: dict[str, Any]) -> dict[str, Any]:
 
 
 def validate_arguments(
-    select: list[str],
-    exclude: list[str],
+    render_config: RenderConfig,
     profile_config: ProfileConfig,
     task_args: dict[str, Any],
-    execution_mode: ExecutionMode,
+    execution_config: ExecutionConfig,
+    project_config: ProjectConfig,
 ) -> None:
     """
     Validate that mutually exclusive selectors filters have not been given.
@@ -84,8 +92,8 @@ def validate_arguments(
     :param execution_mode: the current execution mode
     """
     for field in ("tags", "paths"):
-        select_items = retrieve_by_label(select, field)
-        exclude_items = retrieve_by_label(exclude, field)
+        select_items = retrieve_by_label(render_config.select, field)
+        exclude_items = retrieve_by_label(render_config.exclude, field)
         intersection = {str(item) for item in set(select_items).intersection(exclude_items)}
         if intersection:
             raise CosmosValueError(f"Can't specify the same {field[:-1]} in `select` and `exclude`: " f"{intersection}")
@@ -96,8 +104,21 @@ def validate_arguments(
         if profile_config.profile_mapping:
             profile_config.profile_mapping.profile_args["schema"] = task_args["schema"]
 
-    if execution_mode in [ExecutionMode.LOCAL, ExecutionMode.VIRTUALENV]:
+    if execution_config.execution_mode in [ExecutionMode.LOCAL, ExecutionMode.VIRTUALENV]:
         profile_config.validate_profiles_yml()
+        has_non_empty_dependencies = execution_config.project_path and has_non_empty_dependencies_file(
+            execution_config.project_path
+        )
+        if (
+            has_non_empty_dependencies
+            and (
+                render_config.load_method == LoadMode.DBT_LS
+                or (render_config.load_method == LoadMode.AUTOMATIC and not project_config.is_manifest_available())
+            )
+            and (render_config.dbt_deps != task_args.get("install_deps", True))
+        ):
+            err_msg = f"When using `LoadMode.DBT_LS` and `{execution_config.execution_mode}`, the value of `dbt_deps` in `RenderConfig` should be the same as the `operator_args['install_deps']` value."
+            raise CosmosValueError(err_msg)
 
 
 def validate_initial_user_config(
@@ -130,8 +151,7 @@ def validate_initial_user_config(
             + "If using RenderConfig.dbt_project_path or ExecutionConfig.dbt_project_path, ProjectConfig.dbt_project_path should be None"
         )
 
-    # Cosmos 2.0 will remove the ability to pass in operator_args with 'env' and 'vars' in place of ProjectConfig.env_vars and
-    # ProjectConfig.dbt_vars.
+    # Cosmos 2.0 will remove the ability to pass in operator_args with 'env' in place of ProjectConfig.env_vars.
     if "env" in operator_args:
         warn(
             "operator_args with 'env' is deprecated since Cosmos 1.3 and will be removed in Cosmos 2.0. Use ProjectConfig.env_vars instead.",
@@ -141,15 +161,12 @@ def validate_initial_user_config(
             raise CosmosValueError(
                 "ProjectConfig.env_vars and operator_args with 'env' are mutually exclusive and only one can be used."
             )
-    if "vars" in operator_args:
+    if "install_deps" in operator_args:
         warn(
-            "operator_args with 'vars' is deprecated since Cosmos 1.3 and will be removed in Cosmos 2.0. Use ProjectConfig.vars instead.",
+            "The operator argument `install_deps` is deprecated since Cosmos 1.9 and will be removed in Cosmos 2.0. Use `ProjectConfig.install_dbt_deps` instead.",
             DeprecationWarning,
         )
-        if project_config.dbt_vars:
-            raise CosmosValueError(
-                "ProjectConfig.dbt_vars and operator_args with 'vars' are mutually exclusive and only one can be used."
-            )
+
     # Cosmos 2.0 will remove the ability to pass RenderConfig.env_vars in place of ProjectConfig.env_vars, check that both are not set.
     if project_config.env_vars and render_config.env_vars:
         raise CosmosValueError(
@@ -182,6 +199,33 @@ def validate_changed_config_paths(
         )
 
 
+def override_configuration(
+    project_config: ProjectConfig, render_config: RenderConfig, execution_config: ExecutionConfig, operator_args: dict
+) -> None:
+    """
+    There are a few scenarios where a configuration should override another one.
+    This function changes, in place, render_config, execution_config and operator_args depending on other configurations.
+    """
+    if project_config.dbt_project_path:
+        render_config.project_path = project_config.dbt_project_path
+        execution_config.project_path = project_config.dbt_project_path
+
+    if render_config.dbt_deps is None:
+        render_config.dbt_deps = project_config.install_dbt_deps
+
+    if execution_config.dbt_executable_path:
+        operator_args["dbt_executable_path"] = execution_config.dbt_executable_path
+
+    if execution_config.invocation_mode:
+        operator_args["invocation_mode"] = execution_config.invocation_mode
+
+    if execution_config.execution_mode in (ExecutionMode.LOCAL, ExecutionMode.VIRTUALENV, ExecutionMode.WATCHER):
+        if "install_deps" not in operator_args:
+            operator_args["install_deps"] = project_config.install_dbt_deps
+        if "copy_dbt_packages" not in operator_args:
+            operator_args["copy_dbt_packages"] = project_config.copy_dbt_packages
+
+
 class DbtToAirflowConverter:
     """
     Logic common to build an Airflow DbtDag and DbtTaskGroup from a DBT project.
@@ -210,27 +254,18 @@ class DbtToAirflowConverter:
         *args: Any,
         **kwargs: Any,
     ) -> None:
+        logger.info("::group::Cosmos DAG parsing logs")
+
+        # We copy the configuration so the changes introduced in this method, such as override_configuration,
+        # do not affect other DAGs or TaskGroups that may reuse the same original configuration
+        execution_config = copy.deepcopy(execution_config) if execution_config is not None else ExecutionConfig()
+        render_config = copy.deepcopy(render_config) if render_config is not None else RenderConfig()
+        operator_args = copy.copy(operator_args) if operator_args is not None else {}
 
         project_config.validate_project()
-
-        execution_config = execution_config or ExecutionConfig()
-        render_config = render_config or RenderConfig()
-        operator_args = operator_args or {}
-
         validate_initial_user_config(execution_config, profile_config, project_config, render_config, operator_args)
-
-        if project_config.dbt_project_path:
-            # We copy the configuration so the change does not affect other DAGs or TaskGroups
-            # that may reuse the same original configuration
-            render_config = copy.deepcopy(render_config)
-            execution_config = copy.deepcopy(execution_config)
-            render_config.project_path = project_config.dbt_project_path
-            execution_config.project_path = project_config.dbt_project_path
-
+        override_configuration(project_config, render_config, execution_config, operator_args)
         validate_changed_config_paths(execution_config, project_config, render_config)
-
-        env_vars = project_config.env_vars or operator_args.get("env")
-        dbt_vars = project_config.dbt_vars or operator_args.get("vars")
 
         if execution_config.execution_mode != ExecutionMode.VIRTUALENV and execution_config.virtualenv_dir is not None:
             logger.warning(
@@ -238,11 +273,9 @@ class DbtToAirflowConverter:
                 ExecutionConfig.execution_mode is set to ExecutionMode.VIRTUALENV."
             )
 
-        if not operator_args:
-            operator_args = {}
-
         cache_dir = None
         cache_identifier = None
+
         if settings.enable_cache:
             cache_identifier = cache._create_cache_identifier(dag, task_group)
             cache_dir = cache._obtain_cache_dir_path(cache_identifier=cache_identifier)
@@ -255,10 +288,12 @@ class DbtToAirflowConverter:
             profile_config=profile_config,
             cache_dir=cache_dir,
             cache_identifier=cache_identifier,
-            dbt_vars=dbt_vars,
+            dbt_vars=project_config.dbt_vars,
             airflow_metadata=cache._get_airflow_metadata(dag, task_group),
         )
         self.dbt_graph.load(method=render_config.load_method, execution_mode=execution_config.execution_mode)
+
+        self._add_dbt_project_hash_to_dag_docs(dag)
 
         current_time = time.perf_counter()
         elapsed_time = current_time - previous_time
@@ -267,6 +302,8 @@ class DbtToAirflowConverter:
         )
         previous_time = current_time
 
+        env_vars = operator_args.get("env") or project_config.env_vars
+        dbt_vars = operator_args.get("vars") or project_config.dbt_vars
         task_args = {
             **operator_args,
             "project_dir": execution_config.project_path,
@@ -276,19 +313,17 @@ class DbtToAirflowConverter:
             "env": env_vars,
             "vars": dbt_vars,
             "cache_dir": cache_dir,
+            "manifest_filepath": project_config.manifest_path,
         }
-        if execution_config.dbt_executable_path:
-            task_args["dbt_executable_path"] = execution_config.dbt_executable_path
-        if execution_config.invocation_mode:
-            task_args["invocation_mode"] = execution_config.invocation_mode
 
         validate_arguments(
-            render_config.select,
-            render_config.exclude,
-            profile_config,
-            task_args,
-            execution_mode=execution_config.execution_mode,
+            execution_config=execution_config,
+            profile_config=profile_config,
+            render_config=render_config,
+            task_args=task_args,
+            project_config=project_config,
         )
+
         if execution_config.execution_mode == ExecutionMode.VIRTUALENV and execution_config.virtualenv_dir is not None:
             task_args["virtualenv_dir"] = execution_config.virtualenv_dir
 
@@ -302,6 +337,8 @@ class DbtToAirflowConverter:
             dbt_project_name=render_config.project_name,
             on_warning_callback=on_warning_callback,
             render_config=render_config,
+            async_py_requirements=execution_config.async_py_requirements,
+            execution_config=execution_config,
         )
 
         current_time = time.perf_counter()
@@ -309,3 +346,29 @@ class DbtToAirflowConverter:
         logger.info(
             f"Cosmos performance ({cache_identifier}) - [{platform.node()}|{os.getpid()}]: It took {elapsed_time:.3}s to build the Airflow DAG."
         )
+        logger.info("::endgroup::Cosmos DAG parsing logs")
+
+    def _add_dbt_project_hash_to_dag_docs(self, dag: DAG | None) -> None:
+        """
+        Add dbt project content hash to DAG documentation for Airflow 3 dag versioning support.
+
+        This enables Airflow 3's automatic DAG versioning to detect when dbt project
+        files change, ensuring proper DAG version updates.
+
+        :param dag: The Airflow DAG to add versioning information to. If None, no action is taken.
+        """
+        if dag is None:
+            return
+
+        try:
+            dbt_project_hash = _create_folder_version_hash(self.dbt_graph.project_path)
+            hash_suffix = f"\n\n**dbt project hash:** `{dbt_project_hash}`"
+
+            if dag.doc_md:
+                dag.doc_md += hash_suffix
+            else:
+                dag.doc_md = f"**dbt project hash:** `{dbt_project_hash}`"
+
+            logger.debug(f"Appended dbt project hash {dbt_project_hash} to DAG {dag.dag_id} documentation")
+        except Exception as e:
+            logger.warning(f"Failed to append dbt project hash to DAG documentation: {e}")

@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import hashlib
+from typing import TYPE_CHECKING
+
 from airflow.listeners import hookimpl
-from airflow.models.dag import DAG
-from airflow.models.dagrun import DagRun
+
+if TYPE_CHECKING:
+    from airflow.models.dag import DAG
+    from airflow.models.dagrun import DagRun
 
 from cosmos import telemetry
+from cosmos.constants import _AIRFLOW3_MAJOR_VERSION, AIRFLOW_VERSION
 from cosmos.log import get_logger
+
+AIRFLOW_VERSION_MAJOR = AIRFLOW_VERSION.major
 
 logger = get_logger(__name__)
 
@@ -37,7 +45,18 @@ def total_cosmos_tasks(dag: DAG) -> int:
     return cosmos_tasks
 
 
-# @provide_session
+def get_execution_modes(dag: DAG) -> str:
+    """Determine the execution mode(s) based on task modules in the DAG."""
+    modes = {
+        (getattr(task, "_task_module", None) or task.__class__.__module__).split(".")[2]
+        for task in dag.task_dict.values()
+        if (getattr(task, "_task_module", None) or task.__class__.__module__).startswith("cosmos.")
+    }
+
+    # Sorted to ensure consistent and predictable output
+    return "__".join(sorted(modes))
+
+
 @hookimpl
 def on_dag_run_success(dag_run: DagRun, msg: str) -> None:
     logger.debug("Running on_dag_run_success")
@@ -50,11 +69,17 @@ def on_dag_run_success(dag_run: DagRun, msg: str) -> None:
         logger.debug("The DAG does not use Cosmos")
         return
 
+    if AIRFLOW_VERSION_MAJOR < _AIRFLOW3_MAJOR_VERSION:
+        dag_hash = dag_run.dag_hash
+    else:
+        dag_hash = hashlib.md5(dag_run.dag_id.encode("utf-8")).hexdigest()
+
     additional_telemetry_metrics = {
-        "dag_hash": dag_run.dag_hash,
+        "dag_hash": dag_hash,
         "status": EventStatus.SUCCESS,
         "task_count": len(serialized_dag.task_ids),
         "cosmos_task_count": total_cosmos_tasks(serialized_dag),
+        "execution_modes": get_execution_modes(serialized_dag),
     }
 
     telemetry.emit_usage_metrics_if_enabled(DAG_RUN, additional_telemetry_metrics)
@@ -73,11 +98,17 @@ def on_dag_run_failed(dag_run: DagRun, msg: str) -> None:
         logger.debug("The DAG does not use Cosmos")
         return
 
+    if AIRFLOW_VERSION_MAJOR < _AIRFLOW3_MAJOR_VERSION:
+        dag_hash = dag_run.dag_hash
+    else:
+        dag_hash = hashlib.md5(dag_run.dag_id.encode("utf-8")).hexdigest()
+
     additional_telemetry_metrics = {
-        "dag_hash": dag_run.dag_hash,
+        "dag_hash": dag_hash,
         "status": EventStatus.FAILED,
         "task_count": len(serialized_dag.task_ids),
         "cosmos_task_count": total_cosmos_tasks(serialized_dag),
+        "execution_modes": get_execution_modes(serialized_dag),
     }
 
     telemetry.emit_usage_metrics_if_enabled(DAG_RUN, additional_telemetry_metrics)

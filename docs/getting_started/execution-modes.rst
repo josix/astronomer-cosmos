@@ -12,10 +12,13 @@ Cosmos can run ``dbt`` commands using five different approaches, called ``execut
 5. **aws_eks**: Run ``dbt`` commands from AWS EKS Pods managed by Cosmos (requires a pre-existing Docker image)
 6. **azure_container_instance**: Run ``dbt`` commands from Azure Container Instances managed by Cosmos (requires a pre-existing Docker image)
 7. **gcp_cloud_run_job**: Run ``dbt`` commands from GCP Cloud Run Job instances managed by Cosmos (requires a pre-existing Docker image)
-8. **airflow_async**: (Experimental and introduced since Cosmos 1.7.0) Run the dbt resources from your dbt project asynchronously, by submitting the corresponding compiled SQLs to Apache Airflow's `Deferrable operators <https://airflow.apache.org/docs/apache-airflow/stable/authoring-and-scheduling/deferring.html>`__
+8. **aws_ecs**: Run ``dbt`` commands from AWS ECS instances managed by Cosmos (requires a pre-existing Docker image)
+9. **airflow_async**: (stable since Cosmos 1.9.0) Run the dbt resources from your dbt project asynchronously, by submitting the corresponding compiled SQLs to Apache Airflow's `Deferrable operators <https://airflow.apache.org/docs/apache-airflow/stable/authoring-and-scheduling/deferring.html>`__
+10. **watcher**: (experimental since Cosmos 1.11.0) Run a single ``dbt build`` command from a producer task and have sensor tasks to watch the progress of the producer, with improved DAG run time while maintaining the tasks lineage in the Airflow UI, and ability to retry failed tasks. Check the :ref:`watcher-execution-mode` for more details.
 
 The choice of the ``execution mode`` can vary based on each user's needs and concerns. For more details, check each execution mode described below.
 
+.. _execution-modes-comparison:
 
 .. list-table:: Execution Modes Comparison
    :widths: 25 25 25 25
@@ -53,8 +56,16 @@ The choice of the ``execution mode`` can vary based on each user's needs and con
      - Slow
      - High
      - No
+   * - AWS ECS
+     - Slow
+     - High
+     - No
    * - Airflow Async
+     - Very Fast
      - Medium
+     - Yes
+   * - Watcher
+     - Very Fast
      - None
      - Yes
 
@@ -101,7 +112,7 @@ Also similar to the ``local`` execution mode, Cosmos will by default attempt to 
 Some drawbacks of this approach:
 
 - It is slower than ``local`` because it creates a new Python virtual environment for each Cosmos dbt task run.
-- If dbt is unavailable in the Airflow scheduler, the default ``LoadMode.DBT_LS`` will not work. In this scenario, users must use a `parsing method <parsing-methods.html>`_  that does not rely on dbt, such as ``LoadMode.MANIFEST``.
+- If dbt is unavailable in the Airflow scheduler, the default ``LoadMode.DBT_LS`` will not work. In this scenario, users must use a :ref:`parsing-methods` that does not rely on dbt, such as ``LoadMode.MANIFEST``.
 - Only ``InvocationMode.SUBPROCESS`` is supported currently, attempt to use ``InvocationMode.DBT_RUNNER`` will raise error.
 
 Example of how to use:
@@ -121,7 +132,7 @@ The user has better environment isolation than when using ``local`` or ``virtual
 The other challenge with the ``docker`` approach is if the Airflow worker is already running in Docker, which sometimes can lead to challenges running `Docker in Docker <https://devops.stackexchange.com/questions/676/why-is-docker-in-docker-considered-bad>`__.
 
 This approach can be significantly slower than ``virtualenv`` since it may have to build the ``Docker`` container, which is slower than creating a Virtualenv with ``dbt-core``.
-If dbt is unavailable in the Airflow scheduler, the default ``LoadMode.DBT_LS`` will not work. In this scenario, users must use a `parsing method <parsing-methods.html>`_  that does not rely on dbt, such as ``LoadMode.MANIFEST``.
+If dbt is unavailable in the Airflow scheduler, the default ``LoadMode.DBT_LS`` will not work. In this scenario, users must use a :ref:`parsing-methods` that does not rely on dbt, such as ``LoadMode.MANIFEST``.
 
 Check the step-by-step guide on using the ``docker`` execution mode at :ref:`docker`.
 
@@ -195,6 +206,7 @@ Example DAG:
 Azure Container Instance
 ------------------------
 .. versionadded:: 1.4
+
 Similar to the ``kubernetes`` approach, using ``Azure Container Instances`` as the execution mode gives a very isolated way of running ``dbt``, since the ``dbt`` run itself is run within a container running in an Azure Container Instance.
 
 This execution mode requires the user has an Azure environment that can be used to run Azure Container Groups in (see :ref:`azure-container-instance` for more details on the exact requirements). Similarly to the ``Docker`` and ``Kubernetes`` execution modes, a Docker container should be available, containing the up-to-date ``dbt`` pipelines and profiles.
@@ -222,6 +234,7 @@ Each task will create a new container on Azure, giving full isolation. This, how
 GCP Cloud Run Job
 ------------------------
 .. versionadded:: 1.7
+
 The ``gcp_cloud_run_job`` execution mode is particularly useful for users who prefer to run their ``dbt`` commands on Google Cloud infrastructure, taking advantage of Cloud Run's scalability, isolation, and managed service capabilities.
 
 For the ``gcp_cloud_run_job`` execution mode to work, a Cloud Run Job instance must first be created using a previously built Docker container. This container should include the latest ``dbt`` pipelines and profiles. You can find more details in the `Cloud Run Job creation guide <https://cloud.google.com/run/docs/create-jobs>`__ .
@@ -244,45 +257,55 @@ Each task will create a new Cloud Run Job execution, giving full isolation. The 
     )
 
 
-Airflow Async (experimental)
-----------------------------
+AWS ECS
+---------
+.. versionadded:: 1.9.0
 
-.. versionadded:: 1.7.0
+Using ``AWS Elastic Container Service (ECS)`` as the execution mode provides an isolated and scalable way to run ``dbt`` tasks within an AWS ECS service. This execution mode ensures that each ``dbt`` run is performed inside a dedicated container running in an ECS task.
 
+This execution mode requires the user to have an AWS environment configured to run ECS tasks (see :ref:``aws-ecs`` for more details on the exact requirements). Similar to the ``Docker`` and ``Kubernetes`` execution modes, a Docker container should be available, containing the up-to-date ``dbt`` pipelines and profiles.
 
-(**Experimental**) The ``airflow_async`` execution mode is a way to run the dbt resources from your dbt project using Apache Airflow's
+Each task will create a new ECS task execution, providing full isolation. However, this separation introduces some overhead in execution time due to container startup and provisioning. For users who require faster execution times, configuring appropriate ECS task definitions and cluster optimizations can help mitigate these delays.
+
+Please refer to the step-by-step guide for using AWS ECS as the execution mode.
+
+.. code-block:: python
+
+    aws_ecs_cosmos_dag = DbtDag(
+        # ...
+        execution_config=ExecutionConfig(execution_mode=ExecutionMode.AWS_ECS),
+        operator_args={
+            "aws_conn_id": "aws_default",
+            "cluster": "my-ecs-cluster",
+            "task_definition": "my-dbt-task",
+            "container_name": "dbt-container",
+            "launch_type": "FARGATE",
+            "deferrable": True,
+            "network_configuration": {
+                "awsvpcConfiguration": {
+                    "subnets": ["<<<YOUR SUBNET ID>>>"],
+                    "assignPublicIp": "ENABLED",
+                },
+            },
+            "environment_variables": {"DBT_PROFILE_NAME": "default"},
+        },
+    )
+
+.. _airflow-async-execution-mode:
+
+Airflow Async
+-------------
+
+.. versionadded:: 1.9.0
+
+Although this execution mode was introduced in Cosmos 1.9, we strongly encourage users to use Cosmos 1.11, which has significant performance improvements.
+In comparison to the ``local``, the ``airflow_async`` execution mode can reduce the execution time of a dbt project by up to 36%.
+
+The ``airflow_async`` execution mode is a way to run the dbt resources from your dbt project using Apache Airflow's
 `Deferrable operators <https://airflow.apache.org/docs/apache-airflow/stable/authoring-and-scheduling/deferring.html>`__.
 This execution mode could be preferred when you've long running resources and you want to run them asynchronously by
 leveraging Airflow's deferrable operators. With that, you would be able to potentially observe higher throughput of tasks
 as more dbt nodes will be run in parallel since they won't be blocking Airflow's worker slots.
-
-In this mode, Cosmos adds a new operator, ``DbtCompileAirflowAsyncOperator``, as a root task in the DbtDag or DbtTaskGroup. The task runs
-the ``dbt compile`` command on your dbt project which then outputs compiled SQLs in the project's target directory.
-As part of the same task run, these compiled SQLs are then stored remotely to a remote path set using the
-:ref:`remote_target_path` configuration. The remote path is then used by the subsequent tasks in the DAG to
-fetch (from the remote path) and run the compiled SQLs asynchronously using e.g. the ``DbtRunAirflowAsyncOperator``.
-You may observe that the compile task takes a bit longer to run due to the latency of storing the compiled SQLs
-remotely (e.g. for the classic ``jaffle_shop`` dbt project, upon compiling it produces about 31 files measuring about 124KB in total, but on a local
-machine it took approximately 25 seconds for the task to compile & upload the compiled SQLs to the remote path).,
-however, it is still a win as it is one-time overhead and the subsequent tasks run asynchronously utilising the Airflow's
-deferrable operators and supplying to them those compiled SQLs.
-
-Note that currently, the ``airflow_async`` execution mode has the following limitations and is released as **Experimental**:
-
-1. **Airflow 2.8 or higher required**: This mode relies on Airflow's `Object Storage <https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/objectstorage.html>`__ feature, introduced in Airflow 2.8, to store and retrieve compiled SQLs.
-2. **Limited to dbt models**: Only dbt resource type models are run asynchronously using Airflow deferrable operators. Other resource types are executed synchronously, similar to the local execution mode.
-3. **BigQuery support only**: This mode only supports BigQuery as the target database. If a different target is specified, Cosmos will throw an error indicating the target database is unsupported in this mode.
-4. **ProfileMapping parameter required**: You need to specify the ``ProfileMapping`` parameter in the ``ProfileConfig`` for your DAG. Refer to the example DAG below for details on setting this parameter.
-5. **Supports only full_refresh models**: Currently, only ``full_refresh`` models are supported. To enable this, pass ``full_refresh=True`` in the ``operator_args`` of the ``DbtDag`` or ``DbtTaskGroup``. Refer to the example DAG below for details on setting this parameter.
-6. **location parameter required**: You must specify the location of the BigQuery dataset in the ``operator_args`` of the ``DbtDag`` or ``DbtTaskGroup``. The example DAG below provides guidance on this.
-7. **No dataset emission**: The async run operators do not currently emit datasets, meaning that :ref:`data-aware-scheduling` is not supported at this time. Future releases will address this limitation.
-
-To start leveraging async execution mode that is currently supported for the BigQuery profile type targets you need to install Cosmos with the below additional dependencies:
-
-.. code:: bash
-
-    astronomer-cosmos[dbt-bigquery, google]
-
 
 Example DAG:
 
@@ -291,36 +314,22 @@ Example DAG:
    :start-after: [START airflow_async_execution_mode_example]
    :end-before: [END airflow_async_execution_mode_example]
 
-**Known Issue:**
+For a full step-by-step guide and limitations, check the :ref:`async-execution-mode` page.
 
-The ``dag test`` command failed with the following error, likely because the trigger does not fully initialize during the ``dag test``, leading to an uninitialized task instance.
-This causes the BigQuery trigger to attempt accessing parameters of the Task Instance that are not properly initialized.
 
-.. code:: bash
+Watcher Execution Mode (Experimental)
+-------------------------------------
 
-    [2024-10-01T18:19:09.726+0530] {base_events.py:1738} ERROR - unhandled exception during asyncio.run() shutdown
-    task: <Task finished name='Task-46' coro=<<async_generator_athrow without __name__>()> exception=AttributeError("'NoneType' object has no attribute 'dag_id'")>
-    Traceback (most recent call last):
-      File "/Users/pankaj/Documents/astro_code/astronomer-cosmos/devenv/lib/python3.9/site-packages/airflow/providers/google/cloud/triggers/bigquery.py", line 138, in run
-        yield TriggerEvent(
-    asyncio.exceptions.CancelledError
+.. versionadded:: 1.11.0
 
-    During handling of the above exception, another exception occurred:
+The ``watcher`` execution mode is an experimental execution mode that runs a single ``dbt build`` command from a producer task and has sensor tasks to watch the progress of the producer.
+It is designed to improve DAG run time while maintaining the tasks lineage in the Airflow UI, and ability to retry failed tasks.
 
-    Traceback (most recent call last):
-      File "/Users/pankaj/Documents/astro_code/astronomer-cosmos/devenv/lib/python3.9/site-packages/airflow/providers/google/cloud/triggers/bigquery.py", line 157, in run
-        if self.job_id and self.cancel_on_kill and self.safe_to_cancel():
-      File "/Users/pankaj/Documents/astro_code/astronomer-cosmos/devenv/lib/python3.9/site-packages/airflow/providers/google/cloud/triggers/bigquery.py", line 126, in safe_to_cancel
-        task_instance = self.get_task_instance()  # type: ignore[call-arg]
-      File "/Users/pankaj/Documents/astro_code/astronomer-cosmos/devenv/lib/python3.9/site-packages/airflow/utils/session.py", line 97, in wrapper
-        return func(*args, session=session, **kwargs)
-      File "/Users/pankaj/Documents/astro_code/astronomer-cosmos/devenv/lib/python3.9/site-packages/airflow/providers/google/cloud/triggers/bigquery.py", line 102, in get_task_instance
-        TaskInstance.dag_id == self.task_instance.dag_id,
-    AttributeError: 'NoneType' object has no attribute 'dag_id'
-
+Check the :ref:`watcher-execution-mode` for more details.
 
 
 .. _invocation_modes:
+
 Invocation Modes
 ================
 .. versionadded:: 1.4

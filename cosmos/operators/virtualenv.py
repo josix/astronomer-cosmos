@@ -3,12 +3,17 @@ from __future__ import annotations
 import os
 import shutil
 import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 import psutil
-from airflow.utils.python_virtualenv import prepare_virtualenv
+
+try:  # Airflow 3
+    from airflow.providers.standard.utils.python_virtualenv import prepare_virtualenv
+except ImportError:  # Airflow 2
+    from airflow.utils.python_virtualenv import prepare_virtualenv  # type: ignore[no-redef]
 
 from cosmos import settings
 from cosmos.constants import InvocationMode
@@ -29,9 +34,12 @@ from cosmos.operators.local import (
     DbtTestLocalOperator,
 )
 
-if TYPE_CHECKING:
-    from airflow.utils.context import Context  # pragma: no cover
-    from dbt.cli.main import dbtRunnerResult  # pragma: no cover
+if TYPE_CHECKING:  # pragma: no cover
+    try:
+        from airflow.sdk.definitions.context import Context
+    except ImportError:
+        from airflow.utils.context import Context  # type: ignore[attr-defined]
+    from dbt.cli.main import dbtRunnerResult
 
 PY_INTERPRETER = "python3"
 LOCK_FILENAME = "cosmos_virtualenv.lock"
@@ -76,7 +84,9 @@ class DbtVirtualenvBaseOperator(DbtLocalBaseOperator):
         self.py_requirements = py_requirements or []
         self.pip_install_options = pip_install_options or []
         self.py_system_site_packages = py_system_site_packages
-        self.virtualenv_dir = virtualenv_dir
+        self.virtualenv_dir = Path(virtualenv_dir) if virtualenv_dir else None
+        if self.virtualenv_dir:
+            self.virtualenv_dir.mkdir(parents=True, exist_ok=True)
         self.is_virtualenv_dir_temporary = is_virtualenv_dir_temporary
         self.max_retries_lock = settings.virtualenv_max_retries_lock
         self._py_bin: str | None = None
@@ -85,17 +95,22 @@ class DbtVirtualenvBaseOperator(DbtLocalBaseOperator):
         if not self.py_requirements:
             self.log.error("Cosmos virtualenv operators require the `py_requirements` parameter")
 
-    def run_subprocess(self, command: list[str], env: dict[str, str], cwd: str) -> FullOutputSubprocessResult:
+    def run_subprocess(
+        self, command: list[str], env: dict[str, str], cwd: str, **kwargs: Any
+    ) -> FullOutputSubprocessResult:
         if self._py_bin is not None:
             self.log.info(f"Using Python binary from virtualenv: {self._py_bin}")
             command[0] = str(Path(self._py_bin).parent / "dbt")
-        return super().run_subprocess(command, env, cwd)
+        return super().run_subprocess(command, env, cwd, **kwargs)
 
     def run_command(
         self,
         cmd: list[str],
         env: dict[str, str | bytes | os.PathLike[Any]],
         context: Context,
+        run_as_async: bool = False,
+        async_context: dict[str, Any] | None = None,
+        push_run_results_to_xcom: bool = False,
     ) -> FullOutputSubprocessResult | dbtRunnerResult:
         # No virtualenv_dir set, so create a temporary virtualenv
         if self.virtualenv_dir is None or self.is_virtualenv_dir_temporary:
@@ -103,7 +118,14 @@ class DbtVirtualenvBaseOperator(DbtLocalBaseOperator):
             with TemporaryDirectory(prefix="cosmos-venv") as tempdir:
                 self.virtualenv_dir = Path(tempdir)
                 self._py_bin = self._prepare_virtualenv()
-                return super().run_command(cmd, env, context)
+                return super().run_command(
+                    cmd,
+                    env,
+                    context,
+                    run_as_async=run_as_async,
+                    async_context=async_context,
+                    push_run_results_to_xcom=push_run_results_to_xcom,
+                )
 
         try:
             self.log.info(f"Checking if the virtualenv lock {str(self._lock_file)} exists")
@@ -115,7 +137,14 @@ class DbtVirtualenvBaseOperator(DbtLocalBaseOperator):
             self.log.info("Acquiring the virtualenv lock")
             self._acquire_venv_lock()
             self._py_bin = self._prepare_virtualenv()
-            return super().run_command(cmd, env, context)
+            return super().run_command(
+                cmd,
+                env,
+                context,
+                run_as_async=run_as_async,
+                async_context=async_context,
+                push_run_results_to_xcom=push_run_results_to_xcom,
+            )
         finally:
             self.log.info("Releasing virtualenv lock")
             self._release_venv_lock()
@@ -128,7 +157,7 @@ class DbtVirtualenvBaseOperator(DbtLocalBaseOperator):
             self.log.info(f"Deleting the Python virtualenv {self.virtualenv_dir}")
             shutil.rmtree(str(self.virtualenv_dir), ignore_errors=True)
 
-    def execute(self, context: Context) -> None:
+    def execute(self, context: Context, **kwargs: Any) -> None:
         try:
             output = super().execute(context)
             self.log.info(output)
@@ -138,7 +167,7 @@ class DbtVirtualenvBaseOperator(DbtLocalBaseOperator):
     def on_kill(self) -> None:
         self.clean_dir_if_temporary()
 
-    def _prepare_virtualenv(self) -> str:
+    def _prepare_virtualenv(self) -> Any:
         self.log.info(f"Creating or updating the virtualenv at `{self.virtualenv_dir}")
         py_bin = prepare_virtualenv(
             venv_directory=str(self.virtualenv_dir),
@@ -215,6 +244,8 @@ class DbtLSVirtualenvOperator(DbtVirtualenvBaseOperator, DbtLSLocalOperator):
     and deleted just after.
     """
 
+    template_fields: Sequence[str] = DbtVirtualenvBaseOperator.template_fields  # type: ignore[operator]
+
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
 
@@ -235,6 +266,8 @@ class DbtSnapshotVirtualenvOperator(DbtVirtualenvBaseOperator, DbtSnapshotLocalO
     command and deleted just after.
     """
 
+    template_fields: Sequence[str] = DbtVirtualenvBaseOperator.template_fields  # type: ignore[operator]
+
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
 
@@ -244,6 +277,8 @@ class DbtSourceVirtualenvOperator(DbtVirtualenvBaseOperator, DbtSourceLocalOpera
     Executes `dbt source freshness` command within a Python Virtual Environment, that is created before running the dbt
     command and deleted just after.
     """
+
+    template_fields: Sequence[str] = DbtVirtualenvBaseOperator.template_fields  # type: ignore[operator]
 
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
@@ -265,6 +300,8 @@ class DbtTestVirtualenvOperator(DbtVirtualenvBaseOperator, DbtTestLocalOperator)
     and deleted just after.
     """
 
+    template_fields: Sequence[str] = DbtVirtualenvBaseOperator.template_fields  # type: ignore[operator]
+
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
 
@@ -285,6 +322,8 @@ class DbtDocsVirtualenvOperator(DbtVirtualenvBaseOperator, DbtDocsLocalOperator)
     command and deleted just after.
     """
 
+    template_fields: Sequence[str] = DbtVirtualenvBaseOperator.template_fields  # type: ignore[operator]
+
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
 
@@ -293,6 +332,8 @@ class DbtCloneVirtualenvOperator(DbtVirtualenvBaseOperator, DbtCloneLocalOperato
     """
     Executes a dbt core clone command.
     """
+
+    template_fields: Sequence[str] = DbtVirtualenvBaseOperator.template_fields  # type: ignore[operator]
 
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)

@@ -1,11 +1,7 @@
 from __future__ import annotations
 
+from functools import cache
 from pathlib import Path
-
-try:
-    from functools import cache
-except ImportError:
-    from functools import lru_cache as cache
 
 import airflow
 import pytest
@@ -18,7 +14,6 @@ AIRFLOW_IGNORE_FILE = EXAMPLE_DAGS_DIR / ".airflowignore"
 DBT_VERSION = Version(get_dbt_version().to_version_string()[1:])
 
 MIN_VER_DAG_FILE: dict[str, list[str]] = {
-    "2.4": ["cosmos_seed_dag.py"],
     "2.8": ["cosmos_manifest_example.py"],
 }
 

@@ -25,13 +25,10 @@ To do so:
     #!/bin/sh
 
     export DBT_VENV_PATH="${AIRFLOW_HOME}/dbt_venv"
-    export PIP_USER=false
 
     python3 -m venv "${DBT_VENV_PATH}"
 
     ${DBT_VENV_PATH}/bin/pip install <your-dbt-adapter>
-
-    export PIP_USER=true
 
 
 Install Cosmos
@@ -91,7 +88,6 @@ In your ``my_cosmos_dag.py`` file, import the ``DbtDag`` class from Cosmos and c
     from datetime import datetime
     from cosmos import DbtDag, ProjectConfig, ProfileConfig, ExecutionConfig
     from cosmos.profiles import PostgresUserPasswordProfileMapping
-    from cosmos.constants import ExecutionMode
 
     profile_config = ProfileConfig(
         profile_name="default",

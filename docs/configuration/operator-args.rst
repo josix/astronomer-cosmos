@@ -36,6 +36,46 @@ Example of setting a Cosmos-specific operator argument:
     )
 
 
+.. _operator-args-per-node:
+
+Overriding operator arguments per dbt node (or group of nodes)
+--------------------------------------------------------------
+
+.. versionadded:: 1.8.0
+
+Cosmos 1.8 introduced the capability for users to customise the operator arguments per dbt node, or per group of dbt nodes.
+This can be done by defining the arguments via a dbt meta property alongside other dbt project configurations.
+
+Let's say there is a DbtTaskGroup that sets a default pool to run all the dbt tasks, but a user would like the model expensive
+to run a separate pool.
+
+Users could either use ``operator_args`` or ``default args`` for defining the default behavior:
+
+.. code-block:: python
+
+    dbt_task_group = DbtTaskGroup(
+        # ...
+        profile_config=ProfileConfig,
+        default_args={"pool": "default_pool"},
+    )
+
+While configuring in the ``dbt_project.yml`` a different behaviour for the model "expensive", that should use the "expensive-pool":
+
+.. code-block::
+
+    version: 2
+        models:
+          - name: expensive
+            description: description
+            meta:
+              cosmos:
+                operator_kwargs:
+                  pool: expensive-pool
+
+
+More information about this feature can be found in :ref:`custom-airflow-properties`.
+
+To learn how to customise the profile per dbt model or Cosmos task, check :ref:`profile-customise-per-node`.
 
 Summary of Cosmos-specific arguments
 ------------------------------------
@@ -52,9 +92,13 @@ dbt-related
 - ``models``: Specifies which nodes to include.
 - ``no_version_check``: If set, skip ensuring ``dbt``'s version matches the one specified in the ``dbt_project.yml``.
 - ``quiet``: run ``dbt`` in silent mode, only displaying its error logs.
-- ``vars``: (Deprecated since Cosmos 1.3 use ``ProjectConfig.dbt_vars`` instead) Supply variables to the project. This argument overrides variables defined in the ``dbt_project.yml``.
+- ``vars``: Supply dbt variables to run the task using dbt project. This argument overrides variables defined in the ``dbt_project.yml`` and any values set in ``ProjectConfig.dbt_vars``. Arguments set as dbt ``vars`` in ``operators_args`` will not be used to render the DAG when using ``LoadMode.DBT_LS``. Use  ``ProjectConfig.dbt_vars`` instead for this use-case.
 - ``warn_error``: convert ``dbt`` warnings into errors.
 - ``full_refresh``: If True, then full refresh the node. This only applies to model and seed nodes.
+- ``copy_dbt_packages``: (new in v1.10) When using ``ExecutionMode.LOCAL`` or ``ExecutionMode.VIRTUALENV``, copy the dbt project ``dbt_packages`` instead of creating symbolic links, so Cosmos can run ``dbt deps`` incrementally.
+- ``install_deps``: (deprecated in v1.9, use ``ProjectConfig.install_dbt_deps`` onwards) When using ``ExecutionMode.LOCAL`` or ``ExecutionMode.VIRTUALENV``, run ``dbt deps`` every time a task is executed.
+- ``manifest_filepath`` (new in v1.10.1):  When using ``ExecutionMode.LOCAL`` or ``ExecutionMode.VIRTUALENV``, use the user-defined ``manifest.json`` file.
+
 
 Airflow-related
 ...............
@@ -103,9 +147,33 @@ The following operator args support templating, and are accessible both through 
 - ``env``
 - ``vars``
 - ``full_refresh`` (for the ``build``, ``seed``, and ``run`` operators since Cosmos 1.4.)
+- ``dbt_cmd_flags``
 
 .. note::
     Using Jinja templating for ``env`` and ``vars`` may cause problems when using ``LoadMode.DBT_LS`` to render your DAG.
+
+Example usage of templated ``dbt_cmd_flags`` for microbatch models with event-time ranges:
+
+.. code-block:: python
+
+    DbtDag(
+        # ... other parameters
+        operator_args={
+            "dbt_cmd_flags": [
+                "{% if params.EVENT_TIME_START %}--event-time-start{% endif %}",
+                "{% if params.EVENT_TIME_START %}{{ params.EVENT_TIME_START }}{% endif %}",
+                "{% if params.EVENT_TIME_END %}--event-time-end{% endif %}",
+                "{% if params.EVENT_TIME_END %}{{ params.EVENT_TIME_END }}{% endif %}",
+                "--select",
+                "{{ params.MODEL_NAME }}",
+            ]
+        },
+        params={
+            "EVENT_TIME_START": Param(default=None, type=["null", "string"]),
+            "EVENT_TIME_END": Param(default=None, type=["null", "string"]),
+            "MODEL_NAME": Param(default=None, type=["null", "string"]),
+        },
+    )
 
 The following template fields are only selectable when using the operators in a standalone context (starting in Cosmos 1.4):
 

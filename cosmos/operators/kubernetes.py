@@ -1,15 +1,42 @@
 from __future__ import annotations
 
+import inspect
+import re
+from abc import ABC
+from collections.abc import Callable, Sequence
 from os import PathLike
-from typing import Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any
 
-from airflow.models import TaskInstance
-from airflow.utils.context import Context, context_merge
+import kubernetes.client as k8s
+from airflow.providers.cncf.kubernetes.backcompat.backwards_compat_converters import (
+    convert_env_vars,
+)
+from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
+from airflow.utils.context import context_merge
+
+if TYPE_CHECKING:  # pragma: no cover
+    try:
+        from airflow.sdk.definitions.context import Context
+    except ImportError:
+        from airflow.utils.context import Context  # type: ignore[attr-defined]
+
+try:
+    # apache-airflow-providers-cncf-kubernetes >= 7.14.0
+    from airflow.providers.cncf.kubernetes.callbacks import (
+        KubernetesPodOperatorCallback,
+    )
+except ImportError:
+
+    class KubernetesPodOperatorCallback:  # type: ignore[no-redef]
+        """Mock fallback for older versions. Should not be used in practice."""
+
+        pass
+
 
 from cosmos.config import ProfileConfig
 from cosmos.dbt.parser.output import extract_log_issues
 from cosmos.operators.base import (
-    AbstractDbtBaseOperator,
+    AbstractDbtBase,
     DbtBuildMixin,
     DbtCloneMixin,
     DbtLSMixin,
@@ -21,42 +48,62 @@ from cosmos.operators.base import (
     DbtTestMixin,
 )
 
-DBT_NO_TESTS_MSG = "Nothing to do"
-DBT_WARN_MSG = "WARN"
-
 try:
-    # apache-airflow-providers-cncf-kubernetes >= 7.4.0
-    from airflow.providers.cncf.kubernetes.backcompat.backwards_compat_converters import (
-        convert_env_vars,
-    )
-    from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
-    from airflow.providers.cncf.kubernetes.utils.pod_manager import OnFinishAction
+    from airflow.sdk.bases.operator import BaseOperator  # Airflow 3
 except ImportError:
-    try:
-        # apache-airflow-providers-cncf-kubernetes < 7.4.0
-        from airflow.providers.cncf.kubernetes.operators.kubernetes_pod import KubernetesPodOperator
-    except ImportError:
-        raise ImportError(
-            "Could not import KubernetesPodOperator. Ensure you've installed the Kubernetes provider "
-            "separately or with with `pip install astronomer-cosmos[...,kubernetes]`."
-        )
+    from airflow.models import BaseOperator  # Airflow 2
 
 
-class DbtKubernetesBaseOperator(AbstractDbtBaseOperator, KubernetesPodOperator):  # type: ignore
+class DbtKubernetesBaseOperator(AbstractDbtBase, KubernetesPodOperator):  # type: ignore
     """
     Executes a dbt core cli command in a Kubernetes Pod.
 
     """
 
     template_fields: Sequence[str] = tuple(
-        list(AbstractDbtBaseOperator.template_fields) + list(KubernetesPodOperator.template_fields)
+        list(AbstractDbtBase.template_fields) + list(KubernetesPodOperator.template_fields)
     )
 
     intercept_flag = False
 
     def __init__(self, profile_config: ProfileConfig | None = None, **kwargs: Any) -> None:
         self.profile_config = profile_config
-        super().__init__(**kwargs)
+
+        # In PR #1474, we refactored cosmos.operators.base.AbstractDbtBase to remove its inheritance from BaseOperator
+        # and eliminated the super().__init__() call. This change was made to resolve conflicts in parent class
+        # initializations while adding support for ExecutionMode.AIRFLOW_ASYNC. Operators under this mode inherit
+        # Airflow provider operators that enable deferrable SQL query execution. Since super().__init__() was removed
+        # from AbstractDbtBase and different parent classes require distinct initialization arguments, we explicitly
+        # initialize them (including the BaseOperator) here by segregating the required arguments for each parent class.
+        default_args = kwargs.get("default_args", {})
+        operator_kwargs = {}
+        operator_args: set[str] = set()
+        for clazz in KubernetesPodOperator.__mro__:
+            operator_args.update(inspect.signature(clazz.__init__).parameters.keys())
+            if clazz == BaseOperator:
+                break
+        for arg in operator_args:
+            try:
+                operator_kwargs[arg] = kwargs[arg]
+            except KeyError:
+                pass
+
+        base_kwargs = {}
+        for arg in {*inspect.signature(AbstractDbtBase.__init__).parameters.keys()}:
+            try:
+                base_kwargs[arg] = kwargs[arg]
+            except KeyError:
+                try:
+                    base_kwargs[arg] = default_args[arg]
+                except KeyError:
+                    pass
+
+        AbstractDbtBase.__init__(self, **base_kwargs)
+
+        container_resources = operator_kwargs.get("container_resources")
+        if isinstance(container_resources, dict):
+            operator_kwargs["container_resources"] = k8s.V1ResourceRequirements(**container_resources)
+        KubernetesPodOperator.__init__(self, **operator_kwargs)
 
     def build_env_args(self, env: dict[str, str | bytes | PathLike[Any]]) -> None:
         env_vars_dict: dict[str, str] = dict()
@@ -68,7 +115,14 @@ class DbtKubernetesBaseOperator(AbstractDbtBaseOperator, KubernetesPodOperator):
 
         self.env_vars: list[Any] = convert_env_vars(env_vars_dict)
 
-    def build_and_run_cmd(self, context: Context, cmd_flags: list[str] | None = None) -> Any:
+    def build_and_run_cmd(
+        self,
+        context: Context,
+        cmd_flags: list[str] | None = None,
+        run_as_async: bool = False,
+        async_context: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
         self.build_kube_args(context, cmd_flags)
         self.log.info(f"Running command: {self.arguments}")
         result = KubernetesPodOperator.execute(self, context)
@@ -136,7 +190,197 @@ class DbtSnapshotKubernetesOperator(DbtSnapshotMixin, DbtKubernetesBaseOperator)
         super().__init__(*args, **kwargs)
 
 
-class DbtSourceKubernetesOperator(DbtSourceMixin, DbtKubernetesBaseOperator):
+class DbtTestWarningHandler(KubernetesPodOperatorCallback):  # type: ignore[misc]
+    """
+    This handler can detect warnings from:
+    1. Regular dbt tests (using the standard "Done. PASS=X WARN=Y" pattern)
+    2. Source freshness tests (using "WARN freshness of..." pattern)
+    """
+
+    def __init__(
+        self,
+        on_warning_callback: Callable[..., Any],
+        operator: KubernetesPodOperator,
+        context: Context | None = None,
+    ) -> None:
+        self.on_warning_callback = on_warning_callback
+        self.operator = operator
+        self.context = context
+
+    def on_pod_completion(  # type: ignore[override]
+        self,
+        *,
+        pod: k8s.V1Pod,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Handles warnings by extracting log issues, creating additional context, and calling the
+        on_warning_callback with the updated context.
+
+        Note that the signature of the interface method changed in `cncf.kubernetes` provider version 10.2.0, where the
+        `operator` and `context` parameters were added to all operator callbacks. To maintain forward compatibility
+        with `cncf.kubernetes` provider version 7.14.0 and later, we pass these parameters via instance variables.
+
+        :param pod: the created pod.
+        """
+        if not self.context:
+            self.operator.log.warning("No context provided to the DbtTestWarningHandler.")
+            return
+
+        task = self.context["task_instance"].task
+        if not (isinstance(task, DbtTestKubernetesOperator) or isinstance(task, DbtSourceKubernetesOperator)):
+            self.operator.log.warning(f"Cannot handle dbt warnings for task of type {type(task)}.")
+            return
+
+        # Get the logs from the pod
+        logs = []
+        for log in task.pod_manager.read_pod_logs(pod, "base"):
+            decoded_log = log.decode("utf-8")
+            if decoded_log != "":
+                logs.append(decoded_log)
+
+        logs_text = "\n".join(logs)
+
+        # Check for warnings
+        warning_detected = False
+        if isinstance(task, DbtTestKubernetesOperator):
+            warn_count = self._detect_standard_warnings(logs_text)
+            if warn_count:
+                self.operator.log.info(f"Detected {warn_count} warnings using standard pattern")
+                warning_detected = True
+        elif isinstance(task, DbtSourceKubernetesOperator):
+            source_freshness_warnings = self._detect_source_freshness_warnings(logs_text)
+            if source_freshness_warnings:
+                self.operator.log.info(f"Detected {len(source_freshness_warnings)} source freshness warnings")
+                warning_detected = True
+
+        if not warning_detected:
+            self.operator.log.warning(
+                "Failed to scrape warning count from the pod logs."
+                "Potential warning callbacks could not be triggered."
+            )
+            return
+
+        test_names, test_results = extract_log_issues(logs)
+        context_merge(self.context, test_names=test_names, test_results=test_results)
+        self.on_warning_callback(self.context)
+
+    def _detect_standard_warnings(self, log_text: str) -> int | None:
+        """
+        Detect warnings using the standard dbt summary pattern.
+
+        Pattern: "Done. PASS=X WARN=Y ERROR=Z SKIP=W"
+
+        :param log_text: Complete log text from the pod
+        :return: Number of warnings detected, or None if pattern not found
+        """
+        warn_count_pattern = re.compile(r"Done\. (?:\w+=\d+ )*WARN=(\d+)(?: \w+=\d+)*")
+        match = warn_count_pattern.search(log_text)
+
+        if match:
+            return int(match.group(1))
+        return None
+
+    def _detect_source_freshness_warnings(self, log_text: str) -> list[dict[str, Any]]:
+        """
+        Detect source freshness warnings from dbt logs.
+
+        Pattern examples:
+        - "15:49:21 1 of 1 WARN freshness of auction_net.auction_net_raw ... [WARN in 0.90s]"
+        - "WARN freshness of source_name.table_name"
+
+        :param log_text: Complete log text from the pod
+        :return: List of warning dictionaries
+        """
+        warnings = []
+
+        # Primary pattern for source freshness warnings
+        # Matches: "HH:MM:SS X of Y WARN freshness of source.table ... [WARN in Xs]"
+        freshness_pattern = re.compile(
+            r"(\d{2}:\d{2}:\d{2})\s+"  # timestamp
+            r"\d+\s+of\s+\d+\s+"  # "X of Y"
+            r"WARN\s+freshness\s+of\s+"  # "WARN freshness of"
+            r"([^\s]+)"  # source name
+            r".*?\[WARN\s+in\s+([\d.]+)s\]"  # execution time
+        )
+
+        for match in freshness_pattern.finditer(log_text):
+            timestamp = match.group(1)
+            source_name = match.group(2)
+            execution_time = match.group(3)
+
+            warnings.append(
+                {
+                    "name": f"source_freshness_{source_name}",
+                    "status": "WARN",
+                    "type": "source_freshness",
+                    "source": source_name,
+                    "timestamp": timestamp,
+                    "execution_time": execution_time,
+                }
+            )
+
+        # Secondary pattern for simpler source freshness warnings
+        # Matches: "WARN freshness of source_name"
+        simple_freshness_pattern = re.compile(r"WARN\s+freshness\s+of\s+([^\s]+)")
+
+        for match in simple_freshness_pattern.finditer(log_text):
+            source_name = match.group(1)
+            # Only add if not already captured by primary pattern
+            if not any(w["source"] == source_name for w in warnings):
+                warnings.append(
+                    {
+                        "name": f"source_freshness_{source_name}",
+                        "status": "WARN",
+                        "type": "source_freshness",
+                        "source": source_name,
+                    }
+                )
+
+        return warnings
+
+
+class DbtWarningKubernetesOperator(DbtKubernetesBaseOperator, ABC):
+    """
+    Executes a dbt core test command.
+    """
+
+    def __init__(self, *args: Any, on_warning_callback: Callable[..., Any] | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.warning_handler = None
+        if on_warning_callback:
+            self.warning_handler = DbtTestWarningHandler(on_warning_callback, operator=self)
+            # Support for handling multiple operator callbacks via self.callbacks was added in provider version 10.2.0
+            if isinstance(self.callbacks, list):  # type: ignore[has-type]
+                self.callbacks.append(self.warning_handler)  # type: ignore[has-type,arg-type]
+            else:
+                self.callbacks = self.warning_handler  # type: ignore[assignment]
+
+    def build_and_run_cmd(
+        self,
+        context: Context,
+        cmd_flags: list[str] | None = None,
+        run_as_async: bool = False,
+        async_context: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        if self.warning_handler:
+            self.warning_handler.context = context
+        super().build_and_run_cmd(
+            context=context, cmd_flags=cmd_flags, run_as_async=run_as_async, async_context=async_context
+        )
+
+
+class DbtTestKubernetesOperator(DbtTestMixin, DbtWarningKubernetesOperator):
+    """
+    Executes a dbt core test command.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+
+
+class DbtSourceKubernetesOperator(DbtSourceMixin, DbtWarningKubernetesOperator):
     """
     Executes a dbt source freshness command.
     """
@@ -154,102 +398,6 @@ class DbtRunKubernetesOperator(DbtRunMixin, DbtKubernetesBaseOperator):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-
-
-class DbtTestKubernetesOperator(DbtTestMixin, DbtKubernetesBaseOperator):
-    """
-    Executes a dbt core test command.
-    """
-
-    def __init__(self, on_warning_callback: Callable[..., Any] | None = None, **kwargs: Any) -> None:
-        if not on_warning_callback:
-            super().__init__(**kwargs)
-        else:
-            self.on_warning_callback = on_warning_callback
-            self.is_delete_operator_pod_original = kwargs.get("is_delete_operator_pod", None)
-            if self.is_delete_operator_pod_original is not None:
-                self.on_finish_action_original = (
-                    OnFinishAction.DELETE_POD if self.is_delete_operator_pod_original else OnFinishAction.KEEP_POD
-                )
-            else:
-                self.on_finish_action_original = OnFinishAction(kwargs.get("on_finish_action", "delete_pod"))
-                self.is_delete_operator_pod_original = self.on_finish_action_original == OnFinishAction.DELETE_POD
-            # In order to read the pod logs, we need to keep the pod around.
-            # Depending on the on_finish_action & is_delete_operator_pod settings,
-            # we will clean up the pod later in the _handle_warnings method, which
-            # is called in on_success_callback.
-            kwargs["is_delete_operator_pod"] = False
-            kwargs["on_finish_action"] = OnFinishAction.KEEP_POD
-
-            # Add an additional callback to both success and failure callbacks.
-            # In case of success, check for a warning in the logs and clean up the pod.
-            self.on_success_callback = kwargs.get("on_success_callback", None) or []
-            if isinstance(self.on_success_callback, list):
-                self.on_success_callback += [self._handle_warnings]
-            else:
-                self.on_success_callback = [self.on_success_callback, self._handle_warnings]
-            kwargs["on_success_callback"] = self.on_success_callback
-            # In case of failure, clean up the pod.
-            self.on_failure_callback = kwargs.get("on_failure_callback", None) or []
-            if isinstance(self.on_failure_callback, list):
-                self.on_failure_callback += [self._cleanup_pod]
-            else:
-                self.on_failure_callback = [self.on_failure_callback, self._cleanup_pod]
-            kwargs["on_failure_callback"] = self.on_failure_callback
-
-            super().__init__(**kwargs)
-
-    def _handle_warnings(self, context: Context) -> None:
-        """
-        Handles warnings by extracting log issues, creating additional context, and calling the
-        on_warning_callback with the updated context.
-
-        :param context: The original airflow context in which the build and run command was executed.
-        """
-        if not (
-            isinstance(context["task_instance"], TaskInstance)
-            and isinstance(context["task_instance"].task, DbtTestKubernetesOperator)
-        ):
-            return
-        task = context["task_instance"].task
-        logs = [
-            log.decode("utf-8") for log in task.pod_manager.read_pod_logs(task.pod, "base") if log.decode("utf-8") != ""
-        ]
-
-        should_trigger_callback = all(
-            [
-                logs,
-                self.on_warning_callback,
-                DBT_NO_TESTS_MSG not in logs[-1],
-                DBT_WARN_MSG in logs[-1],
-            ]
-        )
-
-        if should_trigger_callback:
-            warnings = int(logs[-1].split(f"{DBT_WARN_MSG}=")[1].split()[0])
-            if warnings > 0:
-                test_names, test_results = extract_log_issues(logs)
-                context_merge(context, test_names=test_names, test_results=test_results)
-                self.on_warning_callback(context)
-
-        self._cleanup_pod(context)
-
-    def _cleanup_pod(self, context: Context) -> None:
-        """
-        Handles the cleaning up of the pod after success or failure, if
-        there is a on_warning_callback function defined.
-
-        :param context: The original airflow context in which the build and run command was executed.
-        """
-        if not (
-            isinstance(context["task_instance"], TaskInstance)
-            and isinstance(context["task_instance"].task, DbtTestKubernetesOperator)
-        ):
-            return
-        task = context["task_instance"].task
-        if task.pod:
-            task.on_finish_action = self.on_finish_action_original
-            task.cleanup(pod=task.pod, remote_pod=task.remote_pod)
 
 
 class DbtRunOperationKubernetesOperator(DbtRunOperationMixin, DbtKubernetesBaseOperator):

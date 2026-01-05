@@ -27,11 +27,9 @@ cosmos_perf_dag = DbtDag(
         DBT_ROOT_PATH / "perf",
     ),
     profile_config=profile_config,
-    render_config=RenderConfig(
-        dbt_deps=False,
-    ),
+    render_config=RenderConfig(dbt_deps=False, emit_datasets=False),
     # normal dag parameters
-    schedule_interval=None,
+    schedule=None,
     start_date=datetime(2024, 1, 1),
     catchup=False,
     dag_id="performance_dag",

@@ -8,15 +8,27 @@ import json
 import os
 import platform
 import tempfile
+import warnings
 import zlib
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
 from subprocess import PIPE, Popen
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any
 
 from airflow.models import Variable
 
+if TYPE_CHECKING:
+    try:
+        # Airflow 3 onwards
+        from airflow.sdk import ObjectStoragePath
+    except ImportError:
+        try:
+            from airflow.io.path import ObjectStoragePath
+        except ImportError:
+            pass
+
+import cosmos.dbt.runner as dbt_runner
 from cosmos import cache, settings
 from cosmos.cache import (
     _configure_remote_cache_dir,
@@ -33,15 +45,29 @@ from cosmos.constants import (
     DBT_TARGET_PATH_ENVVAR,
     DbtResourceType,
     ExecutionMode,
+    InvocationMode,
     LoadMode,
     SourceRenderingBehavior,
 )
 from cosmos.dbt.parser.project import LegacyDbtProject
-from cosmos.dbt.project import create_symlinks, environ, get_partial_parse_path, has_non_empty_dependencies_file
+from cosmos.dbt.project import (
+    copy_dbt_packages,
+    create_symlinks,
+    environ,
+    get_partial_parse_path,
+    has_non_empty_dependencies_file,
+)
 from cosmos.dbt.selector import select_nodes
 from cosmos.log import get_logger
 
 logger = get_logger(__name__)
+
+
+def _normalize_path(path: str) -> str:
+    """
+    Converts a potentially Windows path string into a Posix-friendly path.
+    """
+    return Path(path.replace("\\", "/")).as_posix()
 
 
 class CosmosLoadDbtException(Exception):
@@ -62,37 +88,60 @@ class DbtNode:
     resource_type: DbtResourceType
     depends_on: list[str]
     file_path: Path
+    package_name: str | None = None
     tags: list[str] = field(default_factory=lambda: [])
     config: dict[str, Any] = field(default_factory=lambda: {})
     has_freshness: bool = False
     has_test: bool = False
+    has_non_detached_test: bool = False
+    downstream: list[str] = field(default_factory=lambda: [])
 
     @property
-    def airflow_task_config(self) -> Dict[str, Any]:
+    def meta(self) -> dict[str, Any]:
         """
-        This method is designed to extend the dbt project's functionality by incorporating Airflow-related metadata into the dbt YAML configuration.
-        Since dbt projects are independent of Airflow, adding Airflow-specific information to the `meta` field within the dbt YAML allows Airflow tasks to
-        utilize this information during execution.
+        Extract node-specific configuration declared in the model dbt YAML configuration.
+        These will be used while instantiating Airflow tasks.
+        """
+        meta_cfg = self.config.get("meta") or {}
+        value = meta_cfg.get("cosmos", {})
+        if not isinstance(value, dict):
+            raise CosmosLoadDbtException(
+                f"Error parsing dbt node <{self.unique_id}>. Invalid type: 'cosmos' in meta must be a dict."
+            )
+        return value
+
+    @property
+    def operator_kwargs_to_override(self) -> dict[str, Any]:
+        """
+        Extract the configuration that will be used to override, at a node level, the keyword arguments passed to create
+        the correspondent Airflow task (named `operator_args` at the `DbtDag` or `DbtTaskGroup` level).
 
         Examples: pool, pool_slots, queue, ...
-        Returns:
-            Dict[str, Any]: A dictionary containing custom metadata configurations for integration with Airflow.
-        """
 
-        if "meta" in self.config:
-            meta = self.config["meta"]
-            if "cosmos" in meta:
-                cosmos = meta["cosmos"]
-                if isinstance(cosmos, dict):
-                    if "operator_kwargs" in cosmos:
-                        operator_kwargs = cosmos["operator_kwargs"]
-                        if isinstance(operator_kwargs, dict):
-                            return operator_kwargs
-                    else:
-                        logger.error(f"Invalid type: 'operator_kwargs' in meta.cosmos must be a dict.")
-                else:
-                    logger.error(f"Invalid type: 'cosmos' in meta must be a dict.")
-        return {}
+        :returns: A dictionary containing the Airflow task argument keys and values.
+        """
+        operator_kwargs = self.meta.get("operator_kwargs", {})
+        if not isinstance(operator_kwargs, dict):
+            raise CosmosLoadDbtException(
+                f"Error parsing dbt node <{self.unique_id}>. Invalid type: 'operator_kwargs' in meta.cosmos must be a dict."
+            )
+        return operator_kwargs
+
+    @property
+    def profile_config_to_override(self) -> dict[str, Any]:
+        """
+        Extract the configuration that will be used to override, at a node level, the profile configuration.
+
+        Examples: `profile_name`, `target_name`, `profiles_yml_filepath`.
+
+        :returns: A dictionary containing the profile configuration that should be overridden at a task-level.
+        """
+        operator_kwargs = self.meta.get("profile_config", {})
+        if not isinstance(operator_kwargs, dict):
+            raise CosmosLoadDbtException(
+                f"Error parsing dbt node <{self.unique_id}>. Invalid type: 'profile_config' in meta.cosmos must be a dict."
+            )
+        return operator_kwargs
 
     @property
     def resource_name(self) -> str:
@@ -113,7 +162,9 @@ class DbtNode:
 
     @property
     def owner(self) -> str:
-        return str(self.config.get("meta", {}).get("owner", ""))
+        config_dict = self.config or {}
+        meta_cfg = config_dict.get("meta") or {}
+        return str(meta_cfg.get("owner", ""))
 
     @property
     def context_dict(self) -> dict[str, Any]:
@@ -129,12 +180,13 @@ class DbtNode:
             "tags": self.tags,
             "config": self.config,
             "has_test": self.has_test,
+            "has_non_detached_test": self.has_non_detached_test,
             "resource_name": self.resource_name,
             "name": self.name,
         }
 
 
-def is_freshness_effective(freshness: Optional[dict[str, Any]]) -> bool:
+def is_freshness_effective(freshness: dict[str, Any] | None) -> bool:
     """Function to find if a source has null freshness. Scenarios where freshness
     looks like:
     "freshness": {
@@ -158,11 +210,8 @@ def is_freshness_effective(freshness: Optional[dict[str, Any]]) -> bool:
     return False
 
 
-def run_command(command: list[str], tmp_dir: Path, env_vars: dict[str, str]) -> str:
+def run_command_with_subprocess(command: list[str], tmp_dir: Path, env_vars: dict[str, str]) -> str:
     """Run a command in a subprocess, returning the stdout."""
-    command = [str(arg) if arg is not None else "<None>" for arg in command]
-    logger.info("Running command: `%s`", " ".join(command))
-    logger.debug("Environment variable keys: %s", env_vars.keys())
     process = Popen(
         command,
         stdout=PIPE,
@@ -186,6 +235,73 @@ def run_command(command: list[str], tmp_dir: Path, env_vars: dict[str, str]) -> 
     return stdout
 
 
+def run_command_with_dbt_runner(command: list[str], tmp_dir: Path | None, env_vars: dict[str, str]) -> str:
+    """Run a command with dbtRunner, returning the stdout."""
+    response = dbt_runner.run_command(command=command, env=env_vars, cwd=str(tmp_dir))
+
+    stderr = ""
+    stdout = ""
+    result_list = (
+        [json.dumps(item.to_dict()) if hasattr(item, "to_dict") else item for item in response.result]
+        if response.result
+        else []
+    )
+    if response.result:
+        stdout = "\n".join(result_list)
+
+    if not response.success:
+        if response.exception:
+            stderr = str(response.exception)
+            if 'Run "dbt deps" to install package dependencies' in stderr and command[1] == "ls":
+                raise CosmosLoadDbtException(
+                    "Unable to run dbt ls command due to missing dbt_packages. Set RenderConfig.dbt_deps=True."
+                )
+        elif response.result:
+            node_names, node_results = dbt_runner.extract_message_by_status(
+                response, ["error", "fail", "runtime error"]
+            )
+            stderr = "\n".join([f"{name}: {result}" for name, result in zip(node_names, node_results)])
+
+    if stderr:
+        details = f"stderr: {stderr}\nstdout: {stdout}"
+        raise CosmosLoadDbtException(f"Unable to run {command} due to the error:\n{details}")
+
+    return stdout
+
+
+def run_command(
+    command: list[str],
+    tmp_dir: Path,
+    env_vars: dict[str, str],
+    invocation_mode: InvocationMode,
+    log_dir: Path | None = None,
+) -> str:
+    """Run a command either with dbtRunner or Python subprocess, returning the stdout."""
+
+    use_dbt_runner = invocation_mode == InvocationMode.DBT_RUNNER and dbt_runner.is_available()
+    runner = "dbt Runner" if use_dbt_runner else "Python subprocess"
+    command = [str(arg) if arg is not None else "<None>" for arg in command]
+    logger.info("Running command with %s: `%s`", runner, " ".join(command))
+    logger.debug("Environment variable keys: %s", env_vars.keys())
+
+    if use_dbt_runner:
+        stdout = run_command_with_dbt_runner(command, tmp_dir, env_vars)
+    else:
+        stdout = run_command_with_subprocess(command, tmp_dir, env_vars)
+
+    logger.debug("dbt ls output: %s", stdout)
+
+    if log_dir is not None:
+        log_filepath = log_dir / DBT_LOG_FILENAME
+        logger.debug("dbt logs available in: %s", log_filepath)
+        if log_filepath.exists():
+            with open(log_filepath) as logfile:
+                for line in logfile:
+                    logger.debug(line.strip())
+
+    return stdout
+
+
 def parse_dbt_ls_output(project_path: Path | None, ls_stdout: str) -> dict[str, DbtNode]:
     """Parses the output of `dbt ls` into a dictionary of `DbtNode` instances."""
     nodes = {}
@@ -195,14 +311,20 @@ def parse_dbt_ls_output(project_path: Path | None, ls_stdout: str) -> dict[str, 
         except json.decoder.JSONDecodeError:
             logger.debug("Skipped dbt ls line: %s", line)
         else:
+            base_path = (
+                project_path.parent / node_dict["package_name"] if node_dict.get("package_name") else project_path  # type: ignore
+            )
+
             try:
                 node = DbtNode(
                     unique_id=node_dict["unique_id"],
+                    package_name=node_dict.get("package_name"),
                     resource_type=DbtResourceType(node_dict["resource_type"]),
                     depends_on=node_dict.get("depends_on", {}).get("nodes", []),
-                    file_path=project_path / node_dict["original_file_path"],
-                    tags=node_dict.get("tags", []),
-                    config=node_dict.get("config", {}),
+                    # dbt-core defined the node path via "original_file_path", dbt fusion identifies it via "path"
+                    file_path=base_path / (node_dict["original_file_path"] or node_dict.get("path")),
+                    tags=node_dict.get("tags") or [],
+                    config=node_dict.get("config") or {},
                     has_freshness=(
                         is_freshness_effective(node_dict.get("freshness"))
                         if DbtResourceType(node_dict["resource_type"]) == DbtResourceType.SOURCE
@@ -262,6 +384,10 @@ class DbtGraph:
             self.dbt_ls_cache_key = ""
         self.dbt_vars = dbt_vars or {}
         self.operator_args = operator_args or {}
+        self.log_dir: Path | None = None
+        self.should_install_dbt_deps = (
+            self.render_config.dbt_deps if isinstance(self.render_config.dbt_deps, bool) else True
+        )
 
     @cached_property
     def env_vars(self) -> dict[str, str]:
@@ -288,8 +414,8 @@ class DbtGraph:
         """
         Change args list in-place so they include dbt vars, if they are set.
         """
-        if self.project.dbt_vars:
-            cmd_args.extend(["--vars", json.dumps(self.project.dbt_vars, sort_keys=True)])
+        if self.dbt_vars:
+            cmd_args.extend(["--vars", json.dumps(self.dbt_vars, sort_keys=True)])
 
     @cached_property
     def dbt_ls_args(self) -> list[str]:
@@ -364,7 +490,7 @@ class DbtGraph:
         else:
             Variable.set(self.dbt_ls_cache_key, cache_dict, serialize_json=True)
 
-    def _get_dbt_ls_remote_cache(self, remote_cache_dir: Path) -> dict[str, str]:
+    def _get_dbt_ls_remote_cache(self, remote_cache_dir: Path | ObjectStoragePath) -> dict[str, str]:
         """Loads the remote cache for dbt ls."""
         cache_dict: dict[str, str] = {}
         remote_cache_key_path = remote_cache_dir / self.dbt_ls_cache_key / "dbt_ls_cache.json"
@@ -385,6 +511,15 @@ class DbtGraph:
         }
         """
         cache_dict: dict[str, str] = {}
+
+        airflow_variable_exceptions: list[type[BaseException]] = [json.decoder.JSONDecodeError, KeyError]
+        try:
+            from airflow.sdk.exceptions import AirflowRuntimeError
+        except ImportError:
+            pass
+        else:
+            airflow_variable_exceptions.append(AirflowRuntimeError)
+
         try:
             remote_cache_dir = _configure_remote_cache_dir()
             cache_dict = (
@@ -392,7 +527,7 @@ class DbtGraph:
                 if remote_cache_dir
                 else Variable.get(self.dbt_ls_cache_key, deserialize_json=True)
             )
-        except (json.decoder.JSONDecodeError, KeyError):
+        except tuple(airflow_variable_exceptions):
             return cache_dict
         else:
             dbt_ls_compressed = cache_dict.pop("dbt_ls_compressed", None)
@@ -442,13 +577,22 @@ class DbtGraph:
         self.update_node_dependency()
 
         logger.info("Total nodes: %i", len(self.nodes))
-        logger.info("Total filtered nodes: %i", len(self.nodes))
+        logger.info("Total filtered nodes: %i", len(self.filtered_nodes))
 
     def run_dbt_ls(
         self, dbt_cmd: str, project_path: Path, tmp_dir: Path, env_vars: dict[str, str]
     ) -> dict[str, DbtNode]:
         """Runs dbt ls command and returns the parsed nodes."""
-        if self.render_config.source_rendering_behavior != SourceRenderingBehavior.NONE:
+
+        # dbt fusion 2.0.0b26 `dbt ls --output json` returns, by default, less keys than dbt-core 1.10.
+        # Default keys returned by dbt-core: ['name', 'resource_type', 'package_name', 'original_file_path', 'unique_id', 'alias', 'config', 'tags', 'depends_on']
+        # Default keys returned by dbt fusion: ['name', 'package_name', 'path', 'resource_type', 'unique_id']
+        # Users can force previous Cosmos behaviour by setting pre_dbt_fusion to True.
+        specify_output_keys = (
+            not settings.pre_dbt_fusion or self.render_config.source_rendering_behavior != SourceRenderingBehavior.NONE
+        )
+
+        if specify_output_keys:
             ls_command = [
                 dbt_cmd,
                 "ls",
@@ -465,21 +609,18 @@ class DbtGraph:
                 "freshness",
             ]
         else:
-            ls_command = [dbt_cmd, "ls", "--output", "json"]
+            ls_command = [
+                dbt_cmd,
+                "ls",
+                "--output",
+                "json",
+            ]
 
         ls_args = self.dbt_ls_args
         ls_command.extend(self.local_flags)
         ls_command.extend(ls_args)
 
-        stdout = run_command(ls_command, tmp_dir, env_vars)
-
-        logger.debug("dbt ls output: %s", stdout)
-        log_filepath = self.log_dir / DBT_LOG_FILENAME
-        logger.debug("dbt logs available in: %s", log_filepath)
-        if log_filepath.exists():
-            with open(log_filepath) as logfile:
-                for line in logfile:
-                    logger.debug(line.strip())
+        stdout = run_command(ls_command, tmp_dir, env_vars, self.render_config.invocation_mode, self.log_dir)
 
         if self.should_use_dbt_ls_cache():
             self.save_dbt_ls_cache(stdout)
@@ -540,8 +681,60 @@ class DbtGraph:
         deps_command = [dbt_cmd, "deps"]
         deps_command.extend(self.local_flags)
         self._add_vars_arg(deps_command)
-        stdout = run_command(deps_command, dbt_project_path, env)
-        logger.debug("dbt deps output: %s", stdout)
+        run_command(deps_command, dbt_project_path, env, self.render_config.invocation_mode, self.log_dir)
+
+    def _copy_or_create_symbolic_links(self, source_dir_path: Path, dest_dir_path: Path) -> None:
+        """
+        This method handles creating symbolic links and/or copying files from the original file to a destination folder.
+
+        Create symbolic links related to:
+        * overall dbt project
+
+        Handle dbt deps related packages. This may involve:
+        * creating a symbolic link
+        * copying the dbt deps related files (dbt packages folder and symbolic link)
+        * doing nothing
+
+        All these cases may seem counter-intuitive, but they were necessary given the following
+        * Running dbt deps can be an expensive operation, specially considering it may run every time a DAG is parsed
+        (during scheduling and each time a task is executed). To not run it in a 50 dbt node DAG can save 3 minutes of
+        processing in the DAG run.
+        * Some users prefer to run `dbt deps` in the CI and "cache it" so Cosmos never runs `dbt deps`
+        * Some users want to use the "cached" dbt deps - but they would also like Cosmos to refresh the dependencies,
+        so they don't need to deploy Cosmos again.
+        * From an operating system perspective, to copy files takes more time than to create symbolic links.
+
+        Also, historically:
+        * Cosmos creates symbolic links to files/folders that are not updated by users, since this is compatible with read-only
+        dbt project paths and this is cheaper than copying those folders.
+
+        The current settings make sense for Cosmos 1.x and allow users to set things in different ways, while being backwards
+        compatible. We should review this for Cosmos 2.x.
+        """
+
+        should_not_create_dbt_deps_symbolic_link = self.should_install_dbt_deps or self.project.copy_dbt_packages
+
+        # The value of ignore_dbt_packages tells the function `create_symlinks` that we should not create a symbolic
+        # link for the `dbt_packages` folder. This can be desired in one or more of the two circumstances:
+        # 1. If we want to freshly install dbt packages (install_dbt_deps = True)
+        # 2. If we want to copy the dbt_packages folder instead of creating a symbolic link (copy_dbt_packages = True)
+        #
+        #  | Use case  | install_dbt_deps | copy_dbt_packages | create_symlinks.ignore_dbt_packages | what happens                 |
+        #  | A         | False            | False             | False                               | should create symlink        |
+        #  | B         | True             | False             | True                                | should run `dbt deps`        |
+        #  | C         | False            | True              | True                                | should copy dbt deps files   |
+        #  | D         | True             | True              | True                                | should copy & run `dbt deps` |
+        #
+        # Use cases description:
+        # A. High performance and deps may become outdated: Users run `dbt deps` outside of Cosmos and give pre-generated dbt packages. Dependencies may become outdated.
+        # B. Low performance and up-to-date deps: Cosmos always run `dbt deps` from scratch, every time the DAG is parsed (every time the DAG is parsed).
+        # C. (Non-practical) Middle performance and deps may become outdated: Users manage `dbt deps` outside of Cosmos and give pre-generated dbt packages. Dependencies may become outdated. More expensive than A, similar behaviour.
+        # D. Middle performance and up-to-date deps: Users run `dbt deps` outside of Cosmos and give pre-generated dbt packages. Cosmos runs dbt deps taking into account those user-generated files.
+
+        create_symlinks(source_dir_path, dest_dir_path, ignore_dbt_packages=should_not_create_dbt_deps_symbolic_link)
+
+        if self.project.copy_dbt_packages:
+            copy_dbt_packages(source_dir_path, dest_dir_path)
 
     def load_via_dbt_ls_without_cache(self) -> None:
         """
@@ -566,7 +759,7 @@ class DbtGraph:
             logger.debug(f"Content of the dbt project dir {project_path}: `{os.listdir(project_path)}`")
             tmpdir_path = Path(tmpdir)
 
-            create_symlinks(project_path, tmpdir_path, self.render_config.dbt_deps)
+            self._copy_or_create_symbolic_links(project_path, tmpdir_path)
 
             latest_partial_parse = None
             if self.project.partial_parse:
@@ -579,9 +772,12 @@ class DbtGraph:
                 logger.info("Partial parse is enabled and the latest partial parse file is %s", latest_partial_parse)
                 cache._copy_partial_parse_to_project(latest_partial_parse, tmpdir_path)
 
-            with self.profile_config.ensure_profile(
-                use_mock_values=self.render_config.enable_mock_profile
-            ) as profile_values, environ(self.env_vars):
+            with (
+                self.profile_config.ensure_profile(
+                    use_mock_values=self.render_config.enable_mock_profile
+                ) as profile_values,
+                environ(self.env_vars),
+            ):
                 (profile_path, env_vars) = profile_values
                 env = os.environ.copy()
                 env.update(env_vars)
@@ -597,12 +793,13 @@ class DbtGraph:
                     self.profile_config.target_name,
                 ]
 
-                self.log_dir = Path(env.get(DBT_LOG_PATH_ENVVAR) or tmpdir_path / DBT_LOG_DIR_NAME)
                 self.target_dir = Path(env.get(DBT_TARGET_PATH_ENVVAR) or tmpdir_path / DBT_TARGET_DIR_NAME)
-                env[DBT_LOG_PATH_ENVVAR] = str(self.log_dir)
                 env[DBT_TARGET_PATH_ENVVAR] = str(self.target_dir)
 
-                if self.render_config.dbt_deps and has_non_empty_dependencies_file(self.project_path):
+                self.log_dir = Path(env.get(DBT_LOG_PATH_ENVVAR) or tmpdir_path / DBT_LOG_DIR_NAME)
+                env[DBT_LOG_PATH_ENVVAR] = str(self.log_dir)
+
+                if self.should_install_dbt_deps and has_non_empty_dependencies_file(self.project_path):
                     if is_cache_package_lockfile_enabled(project_path):
                         latest_package_lockfile = _get_latest_cached_package_lockfile(project_path)
                         if latest_package_lockfile:
@@ -656,6 +853,11 @@ class DbtGraph:
         * self.filtered_nodes
         """
         self.load_method = LoadMode.CUSTOM
+        warnings.warn(
+            "Using `load_method` = `LoadMode.CUSTOM` is deprecated in current version and will"
+            " be removed in Cosmos 2.0",
+            DeprecationWarning,
+        )
         logger.info("Trying to parse the dbt project `%s` using a custom Cosmos method...", self.project.project_name)
 
         if self.render_config.selector:
@@ -741,11 +943,12 @@ class DbtGraph:
             for unique_id, node_dict in resources.items():
                 node = DbtNode(
                     unique_id=unique_id,
+                    package_name=node_dict.get("package_name"),
                     resource_type=DbtResourceType(node_dict["resource_type"]),
                     depends_on=node_dict.get("depends_on", {}).get("nodes", []),
-                    file_path=self.execution_config.project_path / Path(node_dict["original_file_path"]),
-                    tags=node_dict["tags"],
-                    config=node_dict["config"],
+                    file_path=self.execution_config.project_path / _normalize_path(node_dict["original_file_path"]),
+                    tags=node_dict.get("tags") or [],
+                    config=node_dict.get("config") or {},
                     has_freshness=(
                         is_freshness_effective(node_dict.get("freshness"))
                         if DbtResourceType(node_dict["resource_type"]) == DbtResourceType.SOURCE
@@ -765,7 +968,8 @@ class DbtGraph:
 
     def update_node_dependency(self) -> None:
         """
-        This will update the property `has_test` if node has `dbt` test
+        This will update the property `has_test` if node has `dbt` test and update the property
+        `has_non_detached_test` if there's at least one non-detached `dbt` test
 
         Updates in-place:
         * self.filtered_nodes
@@ -776,3 +980,13 @@ class DbtGraph:
                     if node_id in self.filtered_nodes:
                         self.filtered_nodes[node_id].has_test = True
                         self.filtered_nodes[node.unique_id] = node
+                        if (
+                            len(node.depends_on) == 1
+                            or self.render_config.should_detach_multiple_parents_tests is False
+                        ):
+                            self.filtered_nodes[node_id].has_non_detached_test = True
+            else:
+                for parent_node_id in node.depends_on:
+                    parent_node = self.nodes.get(parent_node_id)
+                    if parent_node is not None:
+                        parent_node.downstream.append(node.unique_id)

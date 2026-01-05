@@ -2,14 +2,10 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Generator
 from contextlib import contextmanager
+from functools import cache
 from pathlib import Path
-from typing import Generator
-
-try:
-    from functools import cache
-except ImportError:
-    from functools import lru_cache as cache
 
 import pytest
 from airflow.models.dagbag import DagBag
@@ -104,7 +100,7 @@ def test_perf_dag():
         dag = dag_bag.get_dag("performance_dag")
 
         # verify the integrity of the dag
-        assert dag.task_count == num_models
+        assert len(dag.tasks) == num_models
 
         # measure the time before and after the dag is run
 

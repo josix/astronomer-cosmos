@@ -1,12 +1,17 @@
 import os
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Dict
 
 import aenum
+import airflow
 from packaging.version import Version
 
+AIRFLOW_VERSION = Version(airflow.__version__)
+
+BIGQUERY_PROFILE_TYPE = "bigquery"
 DBT_PROFILE_PATH = Path(os.path.expanduser("~")).joinpath(".dbt/profiles.yml")
+DBT_PROJECT_FILENAME = "dbt_project.yml"
 DEFAULT_DBT_PROFILE_NAME = "cosmos_profile"
 DEFAULT_DBT_TARGET_NAME = "cosmos_target"
 DEFAULT_COSMOS_CACHE_DIR_NAME = "cosmos"
@@ -22,6 +27,7 @@ DBT_LOG_FILENAME = "dbt.log"
 DBT_BINARY_NAME = "dbt"
 DEFAULT_PROFILES_FILE_NAME = "profiles.yml"
 PACKAGE_LOCKFILE_YML = "package-lock.yml"
+DBT_DEFAULT_PACKAGES_FOLDER = "dbt_packages"
 
 DEFAULT_OPENLINEAGE_NAMESPACE = "cosmos"
 OPENLINEAGE_PRODUCER = "https://github.com/astronomer/astronomer-cosmos/"
@@ -29,6 +35,9 @@ OPENLINEAGE_PRODUCER = "https://github.com/astronomer/astronomer-cosmos/"
 # Cosmos will not emit datasets for the following Airflow versions, due to a breaking change that's fixed in later Airflow 2.x versions
 # https://github.com/apache/airflow/issues/39486
 PARTIALLY_SUPPORTED_AIRFLOW_VERSIONS = [Version("2.9.0"), Version("2.9.1")]
+
+
+AIRFLOW_OBJECT_STORAGE_PATH_URL_SCHEMES = ("s3", "gs", "gcs", "wasb", "abfs", "abfss", "az", "http", "https")
 
 
 def _default_s3_conn() -> str:
@@ -49,7 +58,7 @@ def _default_wasb_conn() -> str:
     return WasbHook.default_conn_name  # type: ignore[no-any-return]
 
 
-FILE_SCHEME_AIRFLOW_DEFAULT_CONN_ID_MAP: Dict[str, Callable[[], str]] = {
+FILE_SCHEME_AIRFLOW_DEFAULT_CONN_ID_MAP: dict[str, Callable[[], str]] = {
     "s3": _default_s3_conn,
     "gs": _default_gcs_conn,
     "adl": _default_wasb_conn,
@@ -76,6 +85,8 @@ class TestBehavior(Enum):
     Behavior of the tests.
     """
 
+    __test__ = False
+
     BUILD = "build"
     NONE = "none"
     AFTER_EACH = "after_each"
@@ -87,11 +98,13 @@ class ExecutionMode(Enum):
     Where the Cosmos tasks should be executed.
     """
 
+    WATCHER = "watcher"
     LOCAL = "local"
     AIRFLOW_ASYNC = "airflow_async"
     DOCKER = "docker"
     KUBERNETES = "kubernetes"
     AWS_EKS = "aws_eks"
+    AWS_ECS = "aws_ecs"
     VIRTUALENV = "virtualenv"
     AZURE_CONTAINER_INSTANCE = "azure_container_instance"
     GCP_CLOUD_RUN_JOB = "gcp_cloud_run_job"
@@ -110,6 +123,8 @@ class TestIndirectSelection(Enum):
     """
     Modes to configure the test behavior when performing indirect selection.
     """
+
+    __test__ = False
 
     EAGER = "eager"
     CAUTIOUS = "cautious"
@@ -137,6 +152,7 @@ class DbtResourceType(aenum.Enum):  # type: ignore
     SEED = "seed"
     TEST = "test"
     SOURCE = "source"
+    EXPOSURE = "exposure"
 
     @classmethod
     def _missing_value_(cls, value):  # type: ignore
@@ -159,8 +175,20 @@ SUPPORTED_BUILD_RESOURCES = [
 # https://docs.getdbt.com/reference/commands/test
 TESTABLE_DBT_RESOURCES = {DbtResourceType.MODEL, DbtResourceType.SOURCE, DbtResourceType.SNAPSHOT, DbtResourceType.SEED}
 
-DBT_COMPILE_TASK_ID = "dbt_compile"
+DBT_SETUP_ASYNC_TASK_ID = "dbt_setup_async"
+DBT_TEARDOWN_ASYNC_TASK_ID = "dbt_teardown_async"
 
-TELEMETRY_URL = "https://astronomer.gateway.scarf.sh/astronomer-cosmos/{telemetry_version}/{cosmos_version}/{airflow_version}/{python_version}/{platform_system}/{platform_machine}/{event_type}/{status}/{dag_hash}/{task_count}/{cosmos_task_count}"
-TELEMETRY_VERSION = "v1"
+PRODUCER_WATCHER_TASK_ID = "dbt_producer_watcher"
+
+# Historical telemetry endpoints retained for reference:
+# • v1 (Cosmos 1.8.0–1.10.x)
+#   URL: https://astronomer.gateway.scarf.sh/astronomer-cosmos/{telemetry_version}/{cosmos_version}/{airflow_version}/{python_version}/{platform_system}/{platform_machine}/{event_type}/{status}/{dag_hash}/{task_count}/{cosmos_task_count}
+# • v2 (Cosmos 1.11.0–1.11.x)
+#   URL: https://astronomer.gateway.scarf.sh/astronomer-cosmos/{telemetry_version}/{cosmos_version}/{airflow_version}/{python_version}/{platform_system}/{platform_machine}/{event_type}/{status}/{dag_hash}/{task_count}/{cosmos_task_count}/{execution_modes}
+# • v3 (Cosmos 1.12.0+)
+#   URL: https://astronomer.gateway.scarf.sh/astronomer-cosmos/{telemetry_version}/{event_type}?{query_string}
+TELEMETRY_URL = "https://astronomer.gateway.scarf.sh/astronomer-cosmos/{telemetry_version}/{event_type}?{query_string}"
+TELEMETRY_VERSION = "v3"
 TELEMETRY_TIMEOUT = 1.0
+
+_AIRFLOW3_MAJOR_VERSION = 3
